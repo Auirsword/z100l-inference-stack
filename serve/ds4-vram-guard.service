@@ -1,0 +1,14 @@
+[Unit]
+Description=DS4 VRAM / OOM guard - per-card free VRAM of the running instance, alarm before an allocation fails
+After=ds4-serve.service
+Wants=ds4-serve.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /data/z100l-strata-port/strata/ds4-z100l/serve/vram-guard.py
+Restart=always
+RestartSec=10
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

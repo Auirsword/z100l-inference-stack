@@ -1,0 +1,369 @@
+--- a/src/ds4/ds4_gguf.cu
++++ b/src/ds4/ds4_gguf.cu
+@@ -709,6 +709,24 @@
+                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
+ }
+ 
++// Ordered asynchronous responses carry one unweighted row per pick. cpu_flag[t] is a pick bitmask in this entry only.
++__global__ void __launch_bounds__(128) mx_ordered_kernel(const CombArgs a) {
++    pdl_wait();
++    pdl_trigger();
++    const int t = blockIdx.y, r = blockIdx.x * 128 + threadIdx.x;
++    if (r >= a.n_embd) return;
++    float p[8];
++    for (int i = 0; i < a.k; ++i) {
++        const int q = t * 8 + i;
++        p[i] = a.plan_ptr[q] != 0ull ? a.part[(size_t) q * a.n_embd + r]
++               : a.cpu_flag != nullptr && (a.cpu_flag[t] & (1 << i)) != 0
++                   ? a.cpu_part[(size_t) q * a.cpu_stride + r]
++                   : 0.0f;
++    }
++    a.out[(size_t) t * a.out_stride + r] = combine(a.plan_w + t * 8, p, a.k, nullptr,
++                                                   a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
++}
++
+ __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
+     pdl_wait();
+     if (threadIdx.x != 0) return;
+@@ -1589,7 +1607,8 @@
+     check("moe_gate_up");
+ }
+ 
+-void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
++void moe_down_impl(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s,
++                   bool ordered) {
+     if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
+     Scratch* sc = scratch(s);
+     if (sc == nullptr) return;
+@@ -1628,11 +1647,19 @@
+     c.out_stride = (size_t) a.n_embd;
+     c.k = a.k;
+     c.n_embd = a.n_embd;
+-    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s, c);
+-    check("moe_down");
++    if (ordered) pdl_launch(mx_ordered_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s, c);
++    else pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s, c);
++    check(ordered ? "moe_down_ordered" : "moe_down");
+ }
+ 
+-bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
++void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
++    moe_down_impl(a, h, sh_out, out, s, false);
++}
++void moe_down_ordered(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
++    moe_down_impl(a, h, sh_out, out, s, true);
++}
++
++bool win_experts_impl(const x3::WinArgs& a, cudaStream_t s, bool ordered) {
+     if (a.T < 1 || a.T > kMaxEnt || !mx_geometry("win_experts", a.k, a.n_embd, a.n_ff) || a.h == nullptr ||
+         a.part == nullptr || a.out == nullptr) {
+         std::fprintf(stderr, "ds4 gguf win_experts: not covered (T %d)\n", a.T);
+@@ -1691,11 +1718,15 @@
+     c.out_stride = a.out_stride;
+     c.k = a.k;
+     c.n_embd = a.n_embd;
+-    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s, c);
+-    check("win_experts");
++    if (ordered) pdl_launch(mx_ordered_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s, c);
++    else pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s, c);
++    check(ordered ? "win_experts_ordered" : "win_experts");
+     return true;
+ }
+ 
++bool win_experts(const x3::WinArgs& a, cudaStream_t s) { return win_experts_impl(a, s, false); }
++bool win_experts_ordered(const x3::WinArgs& a, cudaStream_t s) { return win_experts_impl(a, s, true); }
++
+ namespace {
+ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (the inputs / outputs and types to fill in)
+     iq::SetArgs q;
+--- a/src/ds4/ds4_gguf.cuh
++++ b/src/ds4/ds4_gguf.cuh
+@@ -93,7 +93,11 @@
+ /// roles' types in lay.gg_type, see expert_type).
+ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
+ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
++/// DS4_NATIVE_ORDERED_COMBINE's native path: cpu_part holds unweighted [token][pick][n_embd] rows, and cpu_flag[token]
++/// is a bitmask of valid picks. Routed picks are combined in pick order, then the shared expert, as ds4::combine does.
++void moe_down_ordered(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
+ bool win_experts(const x3::WinArgs& a, cudaStream_t s);
++bool win_experts_ordered(const x3::WinArgs& a, cudaStream_t s);
+ void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
+                  cudaStream_t s, const uint16_t* x16 = nullptr);   // (x16: x's rows_f16, ldx apart - the low-bit tiles read it)
+ void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -1338,6 +1338,8 @@
+     // answers in resps with the CPU lane's part, and the device waits for the answer only before the expert sum
+     Req* reqs = nullptr;
+     Resp* resps = nullptr;
++    float* ordered_parts = nullptr;   // opt-in native async: [kRing][kWin][kPicks][dim], unweighted CPU-lane rows
++    bool ordered_async = false;
+     // the helper GPU (DS4_HELPER=<visible GPU>, DS4_HELPER_GB=<its pool>): no layer of its own, outside every device
+     // loop (devs, the groups, the trunk's buffers, the PCIe lane); its pool holds the most-routed of the experts the
+     // layer devices' VRAM leaves over (helper_select), as they are from then on.  A decoded request's picks of them are
+@@ -2922,6 +2924,7 @@
+             err = std::string("DS4_NATIVE_ORDERED_COMBINE=") + ordered_value + ": expected 0 or 1";
+             return false;
+         }
++        ordered_async = ordered_mode == 1 && !sync_decode && !gg::deterministic::enabled();
+         const double t0 = now_ms();
+         if (o.ep != 1 && o.ep != 4) {
+             err = "expert parallel takes --ep 1 or --ep 4";
+@@ -3133,6 +3136,14 @@
+                                      "the next layer's, then the routing and the guesses (DS4_ROUTE_FUSE)%s\n",
+                              route_fuse_win ? "; a decode window's rows too (DS4_ROUTE_FUSE=2)" : "");
+         }
++        if (ordered_async && helper_id >= 0) {
++            err = "DS4_NATIVE_ORDERED_COMBINE=1's asynchronous path does not yet support DS4_HELPER; unset DS4_HELPER";
++            return false;
++        }
++        if (ordered_async && !pk.gguf) {
++            err = "DS4_NATIVE_ORDERED_COMBINE=1's asynchronous path currently requires a GGUF pack";
++            return false;
++        }
+         if (helper_id >= 0 && !helper_open(err)) return false;
+         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
+         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
+@@ -3258,8 +3269,9 @@
+                                            : "native scheduling, streaming and merge unchanged\n");
+         if (ordered_mode == 1)
+             std::fprintf(stderr, "ds4: DS4_NATIVE_ORDERED_COMBINE=1 diagnostic candidate: unweighted (token,pick) rows and "
+-                                 "fixed-pick merge on synchronous host-routed PP/G2 and EP4; native asynchronous direct "
+-                                 "combine is rejected; DS4_DETERMINISTIC and canonical math are not implied\n");
++                                 "fixed-pick merge on synchronous host-routed PP/G2 and EP4; native GGUF asynchronous "
++                                 "windows use per-pick CPU rows (DS4_HELPER and non-GGUF asynchronous packs rejected); "
++                                 "DS4_DETERMINISTIC and canonical math are not implied\n");
+         one_gpu_path();   // (the devices, their groups and the helper GPU known: before the recent slots' count)
+         // (a GGUF: 32 too while streamed experts land in them, DS4_LAND - the link's bytes stay in VRAM)
+         recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && (!file_experts || (pk.gguf && ln_land)) ? 32.0f : 0.0f));
+@@ -4161,6 +4173,10 @@
+             }
+             host_allocs.push_back(m);
+             resps = (Resp*) m;
++            if (ordered_async && !hmap(ordered_parts, (size_t) kRing * kWin * kPicks * g.dim, err)) return false;
++            if (ordered_async)
++                std::fprintf(stderr, "ds4: ordered asynchronous CPU-lane rows: %zu MiB host-mapped\n",
++                             ((size_t) kRing * kWin * kPicks * g.dim * sizeof(float)) >> 20);
+             if (!hmap(lane_done, 32, err)) return false;
+             std::memset((void*) reqs, 0, sizeof(Req) * kRing);
+             std::memset((void*) resps, 0, sizeof(Resp) * kRing);
+@@ -13416,6 +13432,7 @@
+                     else lane_take_win(l, ln_cls[(size_t) lc], picks, lt, next, r.ids, T);
+                 }
+                 std::sort(picks.begin(), picks.end());
++                int pick_of[kWin * kPicks];
+                 for (size_t a = 0; a < picks.size();) {
+                     Ent en;
+                     en.e = picks[a].first;
+@@ -13425,6 +13442,7 @@
+                         const int t = picks[a].second / kPicks, i = picks[a].second % kPicks;
+                         en.tok[en.n++] = t;
+                         tok_of[nslots] = t;
++                        pick_of[nslots] = picks[a].second;
+                         wv[nslots] = r.w[t][i];
+                         ++nslots;
+                         ++a;
+@@ -13453,18 +13471,28 @@
+                     lt.c_ms = now_ms() - tc;
+                     lt.n_cpu = (int) ents.size();
+                     const int D = g.dim;
+-                    for (int t = 0; t < T; ++t) {
+-                        bool any = false;
+-                        for (int sl = 0; sl < nslots; ++sl) any = any || tok_of[sl] == t;
+-                        if (!any) continue;
+-                        float* o = rp.part[t];
+-                        for (int e = 0; e < D; ++e) o[e] = 0.0f;
++                    if (ordered_async) {
++                        float* rows = ordered_parts + (size_t) (next % kRing) * kWin * kPicks * D;
+                         for (int sl = 0; sl < nslots; ++sl) {
+-                            if (tok_of[sl] != t) continue;
+-                            const float* y = c_yd.data() + (size_t) sl * D;
+-                            for (int e = 0; e < D; ++e) o[e] += wv[sl] * y[e];
++                            const int q = pick_of[sl];
++                            std::memcpy(rows + (size_t) q * D, c_yd.data() + (size_t) sl * D,
++                                        (size_t) D * sizeof(float));
++                            rp.cpu[q / kPicks] |= 1 << (q % kPicks);
++                        }
++                    } else {
++                        for (int t = 0; t < T; ++t) {
++                            bool any = false;
++                            for (int sl = 0; sl < nslots; ++sl) any = any || tok_of[sl] == t;
++                            if (!any) continue;
++                            float* o = rp.part[t];
++                            for (int e = 0; e < D; ++e) o[e] = 0.0f;
++                            for (int sl = 0; sl < nslots; ++sl) {
++                                if (tok_of[sl] != t) continue;
++                                const float* y = c_yd.data() + (size_t) sl * D;
++                                for (int e = 0; e < D; ++e) o[e] += wv[sl] * y[e];
++                            }
++                            rp.cpu[t] = 1;
+                         }
+-                        rp.cpu[t] = 1;
+                     }
+                     st.cpu_ms += now_ms() - tc;
+                     st.cpu_experts += nslots;
+@@ -18354,10 +18382,8 @@
+             return false;
+         }
+         if (wp.async) {
+-            if (!gg::deterministic::enabled() &&
+-                gg::native_ordered::parse(std::getenv("DS4_NATIVE_ORDERED_COMBINE")) == 1) {
+-                err = "DS4_NATIVE_ORDERED_COMBINE=1 does not cover native asynchronous direct combine "
+-                      "(mx_combine_kernel with pre-aggregated Resp::part); use synchronous host-routed windows or EP4";
++            if (ordered_async && ordered_parts == nullptr) {
++                err = "DS4_NATIVE_ORDERED_COMBINE=1: asynchronous response rows were not allocated";
+                 return false;
+             }
+             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
+@@ -18439,7 +18465,9 @@
+                 x3::MoeArgs ma;
+                 ma.plan_ptr = d.plan_ptr;
+                 ma.plan_w = d.rw;
+-                ma.cpu_part = lead && !zc_nowait ? resps[slot].part[0] : nullptr;
++                ma.cpu_part = lead && !zc_nowait
++                                  ? ordered_async ? ordered_parts + (size_t) slot * kWin * kPicks * D : resps[slot].part[0]
++                                  : nullptr;
+                 ma.cpu_flag = lead && !zc_nowait ? &resps[slot].cpu[0] : nullptr;
+                 ma.lay = lay;
+                 if (l.n_cls > 1) ma.mix = l.mix;   // (a mixed layer: each expert's class's layout)
+@@ -18464,7 +18492,8 @@
+                 }
+                 if (lead && !zc_nowait) wait_seq(&resps[slot].seq, sq, s);
+                 prof_mark(d, 4);
+-                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
++                if (mx && ordered_async) gg::moe_down_ordered(ma, d.xg, d.sh_out, d.moe_out, s);
++                else if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+             } else {   // each distinct expert read once for the window's tokens
+                 // the PCIe lane (a layer that streams, ln_win): the window's experts the host streams pulled into this
+@@ -18491,8 +18520,10 @@
+                 wa.n_groups = d.n_groups;
+                 wa.plan_ptr = d.plan_ptr;
+                 wa.plan_w = d.rw;
+-                wa.cpu_part = lead ? &resps[slot].part[0][0] : nullptr;
+-                wa.cpu_stride = kMaxDim;
++                wa.cpu_part = lead ? ordered_async ? ordered_parts + (size_t) slot * kWin * kPicks * D
++                                                    : &resps[slot].part[0][0]
++                                   : nullptr;
++                wa.cpu_stride = ordered_async ? (size_t) D : (size_t) kMaxDim;
+                 wa.cpu_flag = lead ? resps[slot].cpu : nullptr;
+                 wa.wait_ptr = lead ? &resps[slot].seq : nullptr;
+                 wa.wait_val = sq;
+@@ -18510,7 +18541,10 @@
+                 wa.n_embd = D;
+                 wa.n_ff = FF;
+                 wa.limit = g.lim;
+-                if (!(lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, s) : x3::win_experts(wa, s))) {
++                const bool ok = lay.fmt == gg::kFmtMXFP4
++                                    ? ordered_async ? gg::win_experts_ordered(wa, s) : gg::win_experts(wa, s)
++                                    : x3::win_experts(wa, s);
++                if (!ok) {
+                     err = "exl3 win_experts failed";
+                     return false;
+                 }
+--- a/tests/ds4_gguf_test.cu
++++ b/tests/ds4_gguf_test.cu
+@@ -5,7 +5,7 @@
+ // lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q6_K; their decode equal to ggml's dequantize_row_* on
+ // random blocks), and layers that put MXFP4 beside a low-bit role; the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
+ // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
+-// ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone) | --ar <device> <device> [rows]
++// ds4_gguf_test [n_embd n_ff] | --ordered [n_embd n_ff] | --kv | --lane | --ar <device> <device> [rows]
+ // (a group of two's chunk all-reduce: DS4_AR2 against the old one, then their times)
+ #include "../src/ds4/ds4_gguf.cuh"
+ #include "../src/ds4/ds4_gguf_cpu.hpp"
+@@ -469,6 +469,82 @@
+     if (!same) ++g_fail;
+     std::printf("%-44s %s\n", "  ... bit for bit the token path's", same ? "ok" : "FAIL");
+ 
++    // Native ordered async: retain one unweighted row per (token, pick), including picks supplied by mapped host RAM.
++    std::vector<float> rows((size_t) T * 8 * D);
++    std::vector<int> masks(T, 0);
++    float* drows = dev(std::vector<float>(rows.size()));
++    std::vector<float> one(1, 1.0f);
++    float* dwone = dev(one);
++    for (int t = 0; t < T; ++t)
++        for (int i = 0; i < k; ++i) {
++            x3::MoeArgs one_a;
++            one_a.plan_ptr = dpp + t * 8 + i;
++            one_a.plan_w = dwone;
++            one_a.lay = E.lay;
++            one_a.k = 1;
++            one_a.n_embd = D;
++            one_a.n_ff = F;
++            one_a.limit = lim;
++            gg::moe_gate_up(one_a, dx + (size_t) t * D, dh, s);
++            gg::moe_down(one_a, dh, nullptr, drows + (size_t) (t * 8 + i) * D, s);
++            if (pp[t * 8 + i] == 0ull) masks[t] |= 1 << i;
++        }
++    CU(cudaStreamSynchronize(s));
++    CU(cudaMemcpy(rows.data(), drows, rows.size() * 4, cudaMemcpyDeviceToHost));
++    int* dmasks = dev(masks);
++    strata::ds4::Combine cm = {};
++    for (int t = 0; t < T; ++t) {
++        cm.n[t] = k;
++        for (int i = 0; i < k; ++i) {
++            cm.row[t][i] = t * 8 + i;
++            cm.w[t][i] = pw[t * 8 + i];
++        }
++    }
++    float* dwant = dev(std::vector<float>((size_t) T * D));
++    strata::ds4::combine(drows, nullptr, dsh, cm, T, D, dwant, s);
++    std::vector<float> ordered_tok((size_t) T * D);
++    for (int t = 0; t < T; ++t) {
++        x3::MoeArgs a;
++        a.plan_ptr = dpp + t * 8;
++        a.plan_w = dpw + t * 8;
++        a.cpu_part = drows;
++        a.cpu_flag = dmasks;   // the ordered entry indexes a whole window; plan_ptr / plan_w alone advance by t
++        a.lay = E.lay;
++        a.k = k;
++        a.n_embd = D;
++        a.n_ff = F;
++        a.limit = lim;
++        gg::moe_gate_up(a, dx + (size_t) t * D, dh, s);
++        gg::moe_down_ordered(a, dh, dsh + (size_t) t * D, dout, s);
++        CU(cudaStreamSynchronize(s));
++        CU(cudaMemcpy(ordered_tok.data() + (size_t) t * D, dout, (size_t) D * 4, cudaMemcpyDeviceToHost));
++    }
++    x3::WinArgs ow = w;
++    ow.cpu_part = drows;
++    ow.cpu_flag = dmasks;
++    ow.cpu_stride = D;
++    if (!gg::win_experts_ordered(ow, s)) ++g_fail;
++    CU(cudaStreamSynchronize(s));
++    const std::vector<float> want_ordered = host(dwant, (size_t) T * D);
++    const std::vector<float> ordered_win = host(dwo, (size_t) T * D);
++    const bool ordered_tok_ok = std::memcmp(ordered_tok.data(), want_ordered.data(), want_ordered.size() * 4) == 0;
++    const bool ordered_win_ok = std::memcmp(ordered_win.data(), want_ordered.data(), want_ordered.size() * 4) == 0;
++    for (int arm = 0; arm < 2; ++arm) {
++        const std::vector<float>& got = arm == 0 ? ordered_tok : ordered_win;
++        size_t differ = 0, at = 0;
++        double worst = 0;
++        for (size_t i = 0; i < got.size(); ++i) {
++            differ += std::memcmp(&got[i], &want_ordered[i], 4) != 0;
++            const double df = std::fabs((double) got[i] - want_ordered[i]);
++            if (df > worst) worst = df, at = i;
++        }
++        if (differ != 0) ++g_fail;
++        std::printf("%-44s %s  %zu of %zu differ, max |diff| %.9g (at %zu: %.9g vs %.9g)\n",
++                    arm == 0 ? "ordered async token vs golden combine" : "ordered async window vs golden combine",
++                    differ == 0 ? "ok" : "FAIL", differ, got.size(), worst, at, got[at], want_ordered[at]);
++    }
++    cudaFree(drows), cudaFree(dwone), cudaFree(dmasks), cudaFree(dwant);
++
+     // the prompt path's set: rows sorted by expert (bounds), each row a token index (row_idx) - experts of a few rows (the
+     // light kernels), then of more (the tiles)
+     for (int R : {100, 200, 400}) {
+@@ -2692,6 +2768,11 @@
+         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+         return g_fail ? 1 : 0;
+     }
++    if (argc >= 2 && std::strcmp(argv[1], "--ordered") == 0) {
++        test_experts(argc >= 4 ? std::atoi(argv[2]) : 512, argc >= 4 ? std::atoi(argv[3]) : 256, s);
++        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
++        return g_fail ? 1 : 0;
++    }
+     if (argc >= 2 && std::strcmp(argv[1], "--kv") == 0) {   // the caches' packing alone
+         test_kv_pack(s);
+         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);

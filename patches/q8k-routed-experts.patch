@@ -1,0 +1,130 @@
+--- a/src/ds4/ds4_gguf.cuh
++++ b/src/ds4/ds4_gguf.cuh
+@@ -76,7 +76,9 @@
+     int k = 0;
+     int rows = 1;   // (DS4_HC_FUSE=2: a window's rows of x, k apart; their int8 rows k apart, scales k / 32 apart)
+ };
+-bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre);
++/// expert_q8k only changes supported low-bit routed-expert activations to the CPU lane's Q8_K rounding; dense and shared
++/// matrices keep their original quantization, including when the same call contains other matrix types.
++bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre, bool expert_q8k = false);
+ /// The int8 rounding mv gives a kFmtQ8_0 job's one F32 input of k values (DS4_Q8_BATCH: its batched launch's, else the
+ /// per-job one's) - what the HC fuse check compares hc_split_pre_norm's against.
+ void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s);
+--- a/src/ds4/ds4_gguf.cu
++++ b/src/ds4/ds4_gguf.cu
+@@ -1389,7 +1389,7 @@
+ 
+ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) { return mv(jobs, n, s, nullptr); }
+ 
+-bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
++bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre, bool expert_q8k) {
+     if (n <= 0 || n > x3::kMaxMvJobs) return false;
+     BfJobs J[3] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones: a launch each
+     int nj[3] = {0, 0, 0}, max_n[3] = {0, 0, 0}, max_c[3] = {1, 1, 1};
+@@ -1399,8 +1399,9 @@
+     Q8Jobs QJ;   // (DS4_Q8_BATCH: the jobs' int8 inputs, one launch before the GEMVs; else each at its job)
+     int nq = 0;
+     const bool batch = q8_batch();
+-    auto quant = [&](const float* x, size_t ldx, int rows, int k, int8_t* q, float* d) {
+-        if (batch) QJ.j[nq++] = {x, ldx, q, d, k, rows};
++    auto quant = [&](const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, bool cpu_q8k = false) {
++        if (cpu_q8k) iq_act_quant(x, ldx, rows, k, q, d, s);
++        else if (batch) QJ.j[nq++] = {x, ldx, q, d, k, rows};
+         else q8_quant(x, ldx, rows, k, q, d, s);
+     };
+     for (int i = 0; i < n; ++i) {
+@@ -1416,9 +1417,15 @@
+                 return false;
+             }
+             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
+-            // (per 32: a dense matrix - the CPU lane computes only experts, so Q8_K's rounding, a scale per 256, would only
+-            //  lose precision here)
+-            quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32);
++            bool cpu_q8k = expert_q8k;
++            switch (m.gg_type) {
++                case iq::kIQ2_XXS: case iq::kIQ2_XS: case iq::kIQ3_XXS: case iq::kIQ1_S:
++                case iq::kIQ3_S: case iq::kIQ2_S: case iq::kIQ4_XS: case iq::kIQ1_M:
++                    break;
++                default:
++                    cpu_q8k = false;
++            }
++            quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, cpu_q8k);
+             iq::MvJob& b = IJ[nij++];
+             b.w = (const uint8_t*) m.raw;
+             b.ld = row_stride(m);
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -5989,7 +5989,7 @@
+                                        count, D, g.ff));
+                 });
+             }
+-            if (!mv_n(d, s, jobs.data(), (int) jobs.size(), err)) return false;
++            if (!mv_n(d, s, jobs.data(), (int) jobs.size(), err, nullptr, true)) return false;
+             swiglu(w.xg, w.xu, (size_t) j.nrows * g.ff, g.lim, w.xhh, s);
+             jobs.clear();
+             for (int i = 0; i < j.nvex; ++i) {
+@@ -6000,7 +6000,7 @@
+                                        w.ed + (size_t) row * D, count, g.ff, D));
+                 });
+             }
+-            if (!mv_n(d, s, jobs.data(), (int) jobs.size(), err)) return false;
++            if (!mv_n(d, s, jobs.data(), (int) jobs.size(), err, nullptr, true)) return false;
+             if (w.rank == 0) {
+                 scatter_rows(w.ed, j.scatter, j.nrows, D, devs[0].ed, s);
+             } else {
+@@ -14331,10 +14331,11 @@
+     }
+ 
+     // a GGUF's matrices (BF16 / MXFP4) to its own kernels, EXL3 ones to x3's
+-    static bool mv_any(const x3::MvJob* j, int n, cudaStream_t s, const gg::PreQ8* pre = nullptr) {
++    static bool mv_any(const x3::MvJob* j, int n, cudaStream_t s, const gg::PreQ8* pre = nullptr,
++                       bool expert_q8k = false) {
+         bool g = false;
+         for (int i = 0; i < n; ++i) g = g || j[i].m->fmt != 0;
+-        return g ? (pre != nullptr ? gg::mv(j, n, s, pre) : gg::mv(j, n, s)) : x3::mv(j, n, s);
++        return g ? gg::mv(j, n, s, pre, expert_q8k) : x3::mv(j, n, s);
+     }
+     bool mv(Dev& d, std::initializer_list<x3::MvJob> jobs, std::string& err) {
+         x3::MvJob j[x3::kMaxMvJobs];
+@@ -14346,9 +14347,10 @@
+         }
+         return true;
+     }
+-    bool mv_n(Dev&, cudaStream_t s, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr) {
++    bool mv_n(Dev&, cudaStream_t s, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr,
++              bool expert_q8k = false) {
+         for (int a = 0; a < n; a += x3::kMaxMvJobs)
+-            if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), s, pre)) {
++            if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), s, pre, expert_q8k)) {
+                 const cudaError_t diagnostic = cudaGetLastError();
+                 std::fprintf(stderr, "EP4 mv failure at job %d: fmt %d gg_type %d k %d n %d ncol %d xcs %zu ycs %zu xf %p y %p stream %p: %s\n",
+                              a, j[a].m->fmt, j[a].m->gg_type, j[a].m->k, j[a].m->n, j[a].ncol,
+@@ -14358,8 +14360,9 @@
+             }
+         return true;
+     }
+-    bool mv_n(Dev& d, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr) {
+-        return mv_n(d, d.st, j, n, err, pre);
++    bool mv_n(Dev& d, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr,
++              bool expert_q8k = false) {
++        return mv_n(d, d.st, j, n, err, pre, expert_q8k);
+     }
+     // y[c] = x[c] W for the T activations x + c * x_cs (floats), into y + c * y_cs
+     static x3::MvJob job(const x3::Mat& m, const float* x, float* y, int T = 1, size_t x_cs = 0, size_t y_cs = 0,
+@@ -18269,13 +18272,13 @@
+                 j[nj++] = job(vm[0], d.xe + (size_t) vrow0[i] * D, d.xg + (size_t) vrow0[i] * g.ff, vn[i], D, g.ff);
+                 j[nj++] = job(vm[1], d.xe + (size_t) vrow0[i] * D, d.xu + (size_t) vrow0[i] * g.ff, vn[i], D, g.ff);
+             }
+-            if (!mv_n(d, j, nj, err)) return false;
++            if (!mv_n(d, j, nj, err, nullptr, true)) return false;
+             swiglu(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
+             nj = 0;
+             for (int i = 0; i < nvex; ++i)
+                 j[nj++] = job(l.vm[(size_t) vex[i]][2], d.xhh + (size_t) vrow0[i] * g.ff, d.ed + (size_t) vrow0[i] * D,
+                               vn[i], g.ff, D);
+-            if (!mv_n(d, j, nj, err)) return false;
++            if (!mv_n(d, j, nj, err, nullptr, true)) return false;
+         }
+         if (!ents.empty()) {
+             const double tc = now_ms();

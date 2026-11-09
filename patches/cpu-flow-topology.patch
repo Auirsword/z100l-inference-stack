@@ -1,0 +1,245 @@
+--- a/src/ds4/ds4_os.hpp
++++ b/src/ds4/ds4_os.hpp
+@@ -9,6 +9,7 @@
+ #include <cstring>
+ #include <cstdio>
+ #include <cstdlib>
++#include <fstream>
+ #include <sstream>
+ #include <string>
+ #include <thread>
+@@ -511,6 +512,67 @@
+ }
+ #endif
+ 
++inline std::string read_text_file(const std::string& path) {
++    std::ifstream file(path);
++    std::stringstream contents;
++    contents << file.rdbuf();
++    return contents.str();
++}
++inline std::vector<int> parse_cpu_list(const std::string& text) {
++    std::vector<int> cpus;
++    std::stringstream parts(text);
++    std::string part;
++    while (std::getline(parts, part, ',')) {
++        if (part.empty() || part == "\n") continue;
++        const size_t dash = part.find('-');
++        const int first = std::atoi(part.c_str());
++        const int last = dash == std::string::npos ? first : std::atoi(part.c_str() + dash + 1);
++        for (int cpu = first; cpu <= last; ++cpu) cpus.push_back(cpu);
++    }
++    return cpus;
++}
++inline std::vector<std::vector<Core>> node_threads() {
++#if defined(_WIN32)
++    std::vector<std::vector<Core>> nodes = node_core_threads();
++#else
++    std::vector<std::vector<Core>> nodes;
++    cpu_set_t allowed;
++    CPU_ZERO(&allowed);
++    const bool have_mask = sched_getaffinity(0, sizeof allowed, &allowed) == 0;
++    auto ok = [&](int cpu) { return cpu >= 0 && (!have_mask || (cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed))); };
++    const std::vector<int> pcores = parse_cpu_list(read_text_file("/sys/devices/cpu_core/cpus"));
++    const bool hybrid = !pcores.empty() && !read_text_file("/sys/devices/cpu_atom/cpus").empty();
++    for (int node = 0; node < 64; ++node) {
++        const std::string list = read_text_file("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
++        if (list.empty()) break;
++        std::vector<Core> cores;
++        std::vector<int> seen;
++        for (int cpu : parse_cpu_list(list)) {
++            if (!ok(cpu)) continue;
++            std::vector<int> siblings = parse_cpu_list(read_text_file(
++                "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list"));
++            if (siblings.empty()) siblings = {cpu};
++            if (std::find(seen.begin(), seen.end(), siblings[0]) != seen.end()) continue;
++            seen.push_back(siblings[0]);
++            Core core;
++            for (int sibling : siblings)
++                if (ok(sibling)) core.cpus.push_back(sibling);
++            if (core.cpus.empty()) continue;
++            core.eff = hybrid && std::find(pcores.begin(), pcores.end(), core.cpus[0]) != pcores.end() ? 1 : 0;
++            cores.push_back(core);
++        }
++        if (!cores.empty()) nodes.push_back(cores);
++    }
++#endif
++    if (nodes.empty()) {
++        std::vector<Core> all;
++        for (unsigned cpu = 0; cpu < std::max(1u, std::thread::hardware_concurrency() / 2); ++cpu)
++            all.push_back({{(int) cpu}, 0});
++        nodes.push_back(all);
++    }
++    return nodes;
++}
++
+ /// Windows' commit (RAM + page file, what every private allocation is charged to - on an integrated GPU the GPU's
+ /// own allocations too): the limit, what this process can still commit, the RAM; all ~0 where there is no such limit
+ /// (Linux overcommits; its RAM is ram_avail's business).
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -159,63 +159,7 @@
+     ss << f.rdbuf();
+     return ss.str();
+ }
+-std::vector<int> cpu_list(const std::string& s) {   // "0-3,8,10-11"
+-    std::vector<int> v;
+-    std::stringstream ss(s);
+-    std::string part;
+-    while (std::getline(ss, part, ',')) {
+-        if (part.empty() || part == "\n") continue;
+-        const size_t dash = part.find('-');
+-        const int a = std::atoi(part.c_str());
+-        const int b = dash == std::string::npos ? a : std::atoi(part.c_str() + dash + 1);
+-        for (int c = a; c <= b; ++c) v.push_back(c);
+-    }
+-    return v;
+-}
+-// each NUMA node's physical cores, each with its logical CPUs (the first one first) and efficiency class, in order -
+-// only the CPUs this process may run on (its affinity: taskset, a container's cpuset), so no worker is pinned to a
+-// CPU it cannot use
+-std::vector<std::vector<os::Core>> node_threads() {
+-#if defined(_WIN32)
+-    std::vector<std::vector<os::Core>> nodes = os::node_core_threads();
+-#else
+-    std::vector<std::vector<os::Core>> nodes;
+-    cpu_set_t allowed;
+-    CPU_ZERO(&allowed);
+-    const bool have_mask = sched_getaffinity(0, sizeof allowed, &allowed) == 0;
+-    auto ok = [&](int c) { return c >= 0 && (!have_mask || (c < CPU_SETSIZE && CPU_ISSET(c, &allowed))); };
+-    // a hybrid Intel CPU's performance cores (the kernel's cpu_core PMU lists them; its E-cores are cpu_atom's)
+-    const std::vector<int> pcores = cpu_list(read_file("/sys/devices/cpu_core/cpus"));
+-    const bool hybrid = !pcores.empty() && !read_file("/sys/devices/cpu_atom/cpus").empty();
+-    for (int n = 0; n < 64; ++n) {
+-        const std::string cl = read_file("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist");
+-        if (cl.empty()) break;
+-        std::vector<os::Core> cores;
+-        std::vector<int> seen;   // (each core once: by its first sibling)
+-        for (int c : cpu_list(cl)) {
+-            if (!ok(c)) continue;
+-            std::vector<int> sib = cpu_list(
+-                read_file("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list"));
+-            if (sib.empty()) sib = {c};
+-            if (std::find(seen.begin(), seen.end(), sib[0]) != seen.end()) continue;
+-            seen.push_back(sib[0]);
+-            os::Core core;
+-            for (int s : sib)
+-                if (ok(s)) core.cpus.push_back(s);
+-            if (core.cpus.empty()) continue;
+-            core.eff = hybrid && std::find(pcores.begin(), pcores.end(), core.cpus[0]) != pcores.end() ? 1 : 0;
+-            cores.push_back(core);
+-        }
+-        if (!cores.empty()) nodes.push_back(cores);
+-    }
+-#endif
+-    if (nodes.empty()) {
+-        std::vector<os::Core> all;
+-        for (unsigned c = 0; c < std::max(1u, std::thread::hardware_concurrency() / 2); ++c) all.push_back({{(int) c}, 0});
+-        nodes.push_back(all);
+-    }
+-    return nodes;
+-}
++std::vector<std::vector<os::Core>> node_threads() { return os::node_threads(); }
+ // anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
+ void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
+ void pin_self(int cpu) { os::pin_self(cpu); }
+--- a/tests/ds4_cpu_flow_test.cpp
++++ b/tests/ds4_cpu_flow_test.cpp
+@@ -3,13 +3,13 @@
+ //
+ //   ds4_cpu_flow_test [--threads N] [--experts N] [--cases N] [--iters N]
+ //
+-// DeepSeek-V4.1-Flash's geometry (5120 -> 2304 -> 5120, K 3), each expert in two NUMA parts (node X: the gate / up
+-// columns [X 1152, ..), the down columns [X 2560, ..)) of random trellis words in memory bound to its node, a pool of
+-// --threads a node pinned to its physical cores (CPU i on node i % 2 here, CPUs 0..43 the physical cores), the caller
+-// on CPU 0 helping node 0's pool as the engine's service thread does.  Random windows (1-12 entries of 1-6 tokens)
+-// for the parity; decode-like ones for the time, the two ways taking turns.
++// DeepSeek-V4.1-Flash's geometry (5120 -> 2304 -> 5120, K 3), each expert in two column partitions. With one NUMA node,
++// both partitions are allocated on node 0 and use disjoint physical-core pools; this is not a two-node benchmark.
++// The production topology discovery filters the process affinity and avoids duplicate SMT siblings. Random windows
++// (1-12 entries of 1-6 tokens) check flow against steps bit for bit; decode-like ones compare their times.
+ #include "../src/ds4/ds4_cpu_exl3.hpp"
+ 
++#include <cerrno>
+ #include <sched.h>
+ #include <sys/mman.h>
+ #include <sys/syscall.h>
+@@ -34,12 +34,19 @@
+     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+     if (p == MAP_FAILED) return nullptr;
+     madvise(p, bytes, MADV_HUGEPAGE);
+-    unsigned long mask = 1ul << node;
+-    if (syscall(SYS_mbind, p, bytes, 2 /*MPOL_BIND*/, &mask, 64, 0) != 0) std::perror("mbind");
++    const unsigned long mask = 1ul << node;
++    if (syscall(SYS_mbind, p, bytes, 2 /*MPOL_BIND*/, &mask, 64, 0) != 0) {
++        const int error = errno;
++        std::fprintf(stderr, "mbind: pid=%d addr=%p bytes=%zu node=%d mask=%#lx maxnode=64: %s\n",
++                     (int) getpid(), p, bytes, node, mask, std::strerror(error));
++        munmap(p, bytes);
++        return nullptr;
++    }
+     return p;
+ }
+ 
+ int main(int argc, char** argv) {
++    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+     int threads = 22, n_exp = 24, cases = 200, iters = 200;
+     for (int i = 1; i + 1 < argc; i += 2) {
+         const std::string a = argv[i];
+@@ -48,27 +55,50 @@
+         else if (a == "--cases") cases = std::atoi(argv[i + 1]);
+         else if (a == "--iters") iters = std::atoi(argv[i + 1]);
+     }
++    if (threads <= 0 || n_exp <= 0 || cases <= 0 || iters <= 0) {
++        std::fprintf(stderr, "threads, experts, cases and iters must be positive\n");
++        return 2;
++    }
+     constexpr int E = 5120, FF = 2304, NH = 2, K2 = 6, kWin = 16, kPicks = 6, S = kWin * kPicks;
+     constexpr int FFh = FF / NH, Eh = E / NH;
+     const size_t mat_gu = (size_t) E / 16 * FFh / 16 * 16 * K2, mat_d = (size_t) FF / 16 * Eh / 16 * 16 * K2;
+     const size_t part_bytes = 2 * mat_gu + mat_d;
++    const auto topology = strata::ds4::os::node_threads();
++    const bool one_node = topology.size() == 1;
++    const int caller = topology[0][0].cpus[0];
+     {
+         cpu_set_t set;
+         CPU_ZERO(&set);
+-        CPU_SET(0, &set);
+-        sched_setaffinity(0, sizeof set, &set);
++        CPU_SET(caller, &set);
++        if (sched_setaffinity(0, sizeof set, &set) != 0) {
++            std::perror("sched_setaffinity");
++            return 1;
++        }
+     }
++    if (one_node)
++        std::fprintf(stderr, "one NUMA node: both partitions use node 0 and disjoint physical-core pools; "
++                             "not a two-node benchmark\n");
+     std::vector<std::unique_ptr<Pool>> pools;
+     for (int X = 0; X < NH; ++X) {
+         std::vector<int> cpus;
+-        for (int c = X; c < 44 && (int) cpus.size() < threads; c += 2) cpus.push_back(c);
+-        if (X == 0) cpus.erase(cpus.begin());   // (CPU 0: the caller's)
+-        pools.push_back(std::make_unique<Pool>((int) cpus.size(), cpus, 20000));
++        const auto& cores = topology[one_node ? 0 : X];
++        for (size_t i = 0; i < cores.size(); ++i) {
++            if (one_node && (int) i % 2 != X) continue;
++            const int cpu = cores[i].cpus[0];
++            if (cpu != caller) cpus.push_back(cpu);
++        }
++        if (cpus.empty()) {
++            std::fprintf(stderr, "CPU flow pool %d has no allowed physical core\n", X);
++            return 1;
++        }
++        const int workers = std::min(threads, (int) cpus.size());
++        std::fprintf(stderr, "CPU flow pool %d: %d workers on node %d\n", X, workers, one_node ? 0 : X);
++        pools.push_back(std::make_unique<Pool>(workers, cpus, 20000));
+     }
+     // the parts: [expert][node] gate | up | down trellis, the scales beside (FP16 near 1)
+     uint8_t* mem[NH];
+     for (int X = 0; X < NH; ++X) {
+-        mem[X] = (uint8_t*) node_alloc(part_bytes * n_exp, X);
++        mem[X] = (uint8_t*) node_alloc(part_bytes * n_exp, one_node ? 0 : X);
+         if (mem[X] == nullptr) {
+             std::fprintf(stderr, "no memory\n");
+             return 1;

@@ -1,0 +1,75 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -191,6 +191,8 @@
+   add_executable(ds4_ablate_test tests/ds4_ablate_test.cpp)
+   target_link_libraries(ds4_ablate_test PRIVATE strata_artifact)
+   add_test(NAME ds4_ablate_test COMMAND ds4_ablate_test)
++  add_executable(ds4_ep_test tests/ds4_ep_test.cpp)
++  add_test(NAME ds4_ep_test COMMAND ds4_ep_test)
+ endif()
+ 
+ # ---- strata_plan ----------------------------------------------------------
+--- a/src/ds4/ds4_iq.cu
++++ b/src/ds4/ds4_iq.cu
+@@ -107,12 +107,13 @@
+     }
+ }
+ 
+-// (#529) DS4_IQ_STRICT_FP: on RDNA 4 (gfx1200 / gfx1201) ROCm's clang contracted the token kernels' (NE 1) and the
+-// window kernels' (NE 4) multiply-adds differently, so their sums differed in the last bits (ds4_gguf_test there):
++// (#529) DS4_IQ_STRICT_FP: on RDNA 4 (gfx1200 / gfx1201) and gfx906 the compiler contracted the token kernels' (NE 1)
++// and window kernels' (NE 4) multiply-adds differently, so their sums differed in the last bits (ds4_gguf_test there):
+ // there every rounding is explicit (no contraction, barriers the compiler cannot fold through) and IQ4_XS's rows load
+ // in 16-bit halves.  Elsewhere - gfx11 and the other AMD GPUs, CUDA - the kernels compile as before (the same bits and
+ // speed as v1.1.30: the barriers cost a Strix Halo ~7% of its decode).
+-#if defined(STRATA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__))
++#if defined(STRATA_USE_HIP) && defined(__clang__) && \
++    (defined(__gfx906__) || defined(__gfx1200__) || defined(__gfx1201__))
+ #define DS4_IQ_STRICT_FP 1
+ #else
+ #define DS4_IQ_STRICT_FP 0
+--- a/tests/hip/intrinsics.cpp
++++ b/tests/hip/intrinsics.cpp
+@@ -36,6 +36,19 @@
+     results[i * 4 + 1] = __vsubss4(a, b);
+     results[i * 4 + 2] = __vcmpne4(a, b);
+     results[i * 4 + 3] = __byte_perm(a, b, selector(i));
++}
++
++__global__ void logical_warp_probe(uint32_t* results) {
++    __shared__ unsigned values[64];
++    const unsigned lane = threadIdx.x;
++    const unsigned base = lane & ~31u;
++    const unsigned local = lane & 31u;
++    values[lane] = lane * 7u;
++    __syncwarp(0xffffffffu);
++    results[lane * 4 + 0] = __ballot_sync(0xffffffffu, (lane & 1u) == (base ? 1u : 0u));
++    results[lane * 4 + 1] = __shfl_sync(0xffffffffu, lane, 0, 32);
++    results[lane * 4 + 2] = __shfl_down_sync(0xffffffffu, lane, 1, 32);
++    results[lane * 4 + 3] = values[base + (local ^ 1u)];
+ }
+ 
+ __global__ void intrinsic_probe(int* integer_results, float* float_shuffle, double* double_shuffle,
+@@ -203,6 +216,22 @@
+         }
+     }
+     delete[] host;
++    if (properties.warpSize == 2 * kLanes) {
++        uint32_t* logical = nullptr;
++        uint32_t logical_host[64 * 4]{};
++        CHECK(hipMalloc(reinterpret_cast<void**>(&logical), sizeof(logical_host)));
++        hipLaunchKernelGGL(logical_warp_probe, dim3(1), dim3(64), 0, 0, logical);
++        CHECK(hipDeviceSynchronize());
++        CHECK(hipMemcpy(logical_host, logical, sizeof(logical_host), hipMemcpyDeviceToHost));
++        for (unsigned lane = 0; lane < 64; ++lane) {
++            const unsigned base = lane & ~31u, local = lane & 31u;
++            ok = ok && logical_host[lane * 4 + 0] == (base ? 0xaaaaaaaau : 0x55555555u);
++            ok = ok && logical_host[lane * 4 + 1] == base;
++            ok = ok && logical_host[lane * 4 + 2] == (local == 31 ? lane : lane + 1);
++            ok = ok && logical_host[lane * 4 + 3] == (base + (local ^ 1u)) * 7u;
++        }
++        CHECK(hipFree(logical));
++    }
+     if (!ok) {
+         std::fprintf(stderr, "HIP intrinsic parity failed (ballot 0x%08x)\n", ballot);
+         return 1;

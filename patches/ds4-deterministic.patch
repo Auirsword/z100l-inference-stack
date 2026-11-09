@@ -1,0 +1,1775 @@
+--- a/src/ds4/ds4_gguf.cu
++++ b/src/ds4/ds4_gguf.cu
+@@ -3,6 +3,7 @@
+ #include "ds4_pdl.cuh"
+ 
+ #include "ds4_iq.cuh"
++#include "ds4_deterministic_math.hpp"
+ #include "ds4_numerics.cuh"
+ 
+ #include <cuda_fp16.h>
+@@ -259,7 +260,7 @@
+     return (i & 0x007fffff) - 0x00400000;
+ }
+ __global__ void __launch_bounds__(256) q8k_quant_kernel(const float* __restrict__ x, size_t ldx, int k,
+-                                                        int8_t* __restrict__ q, float* __restrict__ d) {
++                                                        int8_t* __restrict__ q, float* __restrict__ d, bool strict) {
+     pdl_wait();
+     pdl_trigger();
+     __shared__ float s_am[8];
+@@ -288,14 +289,19 @@
+     if (amax > 0.0f) {
+         const float mx = x[(size_t) r * ldx + (size_t) blockIdx.x * 256 + (size_t) s_at[0]];
+         const float iscale = __fdiv_rn(-127.0f, mx);
+-        qv = (int8_t) min(127, q8k_nearest(__fmul_rn(iscale, v)));
++        const float product = __fmul_rn(iscale, v);
++        if (strict) {
++            volatile float rounded = product;
++            qv = (int8_t) min(127, q8k_nearest(rounded));
++        } else qv = (int8_t) min(127, q8k_nearest(product));
+         dv = __fdiv_rn(1.0f, iscale);
+     }
+     q[(size_t) r * k + at] = qv;
+     if (lane == 0) d[(size_t) r * (k / 32) + at / 32] = dv;
+ }
+ void q8k_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
+-    pdl_launch(q8k_quant_kernel, dim3((unsigned) (k / 256), (unsigned) rows), 256, 0, s, x, ldx, k, q, d);
++    pdl_launch(q8k_quant_kernel, dim3((unsigned) (k / 256), (unsigned) rows), 256, 0, s, x, ldx, k, q, d,
++               deterministic::enabled());
+ }
+ // the low-bit experts' activations: Q8_K's rounding (the CPU lane's; DS4_IQ_Q8K=0: q8_1's, per 32)
+ bool iq_q8k() {
+@@ -306,7 +312,7 @@
+     return on;
+ }
+ void iq_act_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
+-    if (iq_q8k() && k % 256 == 0) q8k_quant(x, ldx, rows, k, q, d, s);
++    if ((iq_q8k() || deterministic::enabled()) && k % 256 == 0) q8k_quant(x, ldx, rows, k, q, d, s);
+     else q8_quant(x, ldx, rows, k, q, d, s);
+ }
+ 
+@@ -1487,7 +1493,7 @@
+     }
+     if (nq > 0) q8_quant_jobs(QJ, nq, s);
+     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
+-    if (nij > 0 && !iq::mv(IJ, nij, s)) {
++    if (nij > 0 && !iq::mv(IJ, nij, s, expert_q8k && deterministic::enabled())) {
+         fail("mv: a low-bit job not covered");
+         return false;
+     }
+@@ -1564,7 +1570,10 @@
+         ia.xq = sc->xq;
+         ia.xd = sc->xd;
+         iq_act_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
+-        iq::gate_up(ia, a.k, 1, s);
++        if (!iq::gate_up(ia, a.k, 1, s, deterministic::enabled())) {
++            fail("DS4_DETERMINISTIC only supports Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S gate/up");
++            return;
++        }
+         check("moe_gate_up");
+         return;
+     }
+@@ -1598,7 +1607,10 @@
+         ia.part = sc->part;
+         ia.hq = sc->hq;
+         ia.hd = sc->hd;
+-        iq::down(ia, a.k, 1, s);
++        if (!iq::down(ia, a.k, 1, s, deterministic::enabled())) {
++            fail("DS4_DETERMINISTIC only supports Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S down");
++            return;
++        }
+     } else {
+         launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
+     }
+@@ -1659,11 +1671,11 @@
+     }
+     (mx_gu ? q8_quant : iq_act_quant)(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
+     if (mx_gu) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
+-    else iq::gate_up(ia, groups, a.T, s);
++    else if (!iq::gate_up(ia, groups, a.T, s, deterministic::enabled())) return false;
+     // (rows of picks not on the device: unused)
+     (mx_d ? q8_quant : iq_act_quant)(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);
+     if (mx_d) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
+-    else iq::down(ia, groups, a.T, s);
++    else if (!iq::down(ia, groups, a.T, s, deterministic::enabled())) return false;
+     if (a.wait_ptr != nullptr) pdl_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
+     CombArgs c{};
+     c.plan_ptr = a.plan_ptr;
+--- a/src/ds4/ds4_iq.cu
++++ b/src/ds4/ds4_iq.cu
+@@ -1,6 +1,7 @@
+ // src/ds4/ds4_iq.cu - a GGUF's low-bit routed experts on the device (see ds4_iq.cuh).  The block layouts and grids are
+ // ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
+ #include "ds4_iq.cuh"
++#include "ds4_deterministic_math.hpp"
+ #include "ds4_pdl.cuh"
+ #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
+ #include "strata/prefill/moe_mmq.hpp"
+@@ -1087,6 +1088,107 @@
+         }
+ }
+ 
++template <int T>
++__device__ __forceinline__ float canonical_row(const uint8_t* w, const int8_t* xq, const float* xd, int k) {
++    static_assert(T == kIQ2_XXS || T == kIQ2_S || T == kIQ3_XXS || T == kIQ3_S,
++                  "the canonical reference covers Maya-S's four expert formats");
++    const uint32_t* tab = T == kIQ2_XXS ? (const uint32_t*) iq2xxs_grid
++                         : T == kIQ2_S   ? (const uint32_t*) iq2s_grid
++                         : T == kIQ3_XXS ? (const uint32_t*) iq3xxs_grid
++                                         : (const uint32_t*) iq3s_grid;
++    float lanes[8] = {};
++    for (int kb = 0; kb < k / 32; kb += 8) {
++        int sums[8] = {};
++#pragma unroll
++        for (int sub = 0; sub < 8; ++sub) {
++            Sub s;
++            decode<T>(w, kb + sub, tab, s);
++            const int8_t* x = xq + (kb + sub) * 32;
++#pragma unroll
++            for (int j = 0; j < 8; ++j) sums[j] += (j < 4 ? s.s0 : s.s1) * __dp4a(s.q[j], ((const int*) x)[j], 0);
++        }
++        const float d = fmul_no_fma(h2f(w + (size_t) (kb >> 3) * Ty<T>::B), xd[kb]);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) lanes[j] = fma_no_contract(d, (float) sums[j], lanes[j]);
++    }
++    const float a = __fadd_rn(__fadd_rn(lanes[4], lanes[0]), __fadd_rn(lanes[6], lanes[2]));
++    const float b = __fadd_rn(__fadd_rn(lanes[5], lanes[1]), __fadd_rn(lanes[7], lanes[3]));
++    return (T == kIQ2_XXS || T == kIQ2_S ? 0.125f : T == kIQ3_XXS ? 0.25f : 1.0f) * __fadd_rn(a, b);
++}
++
++template <int T>
++__global__ void __launch_bounds__(kThreads) canonical_mv_kernel(const Jobs J) {
++    pdl_wait();
++    pdl_trigger();
++    const MvJob& b = J.j[blockIdx.y];
++    const int row = blockIdx.x * kThreads + threadIdx.x;
++    if (row >= b.n) return;
++    const uint8_t* w = b.w + (size_t) row * b.ld;
++    for (int c = 0; c < b.ncol; ++c) {
++        const float v = canonical_row<T>(w, b.xq + (size_t) c * b.k, b.xd + (size_t) c * (b.k / 32), b.k);
++        b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
++    }
++}
++
++template <int T, bool GU>
++__global__ void __launch_bounds__(kThreads) canonical_win_kernel(const Args a) {
++    pdl_wait();
++    pdl_trigger();
++    __shared__ int es[16], xr[16];
++    const uint8_t* blob;
++    int m0, m1;
++    if (!group(a, blockIdx.y, blob, m0, m1)) return;
++    for (int mm = m0; mm < m1; mm += 16) {
++        const int ne = min(16, m1 - mm);
++        __syncthreads();
++        if ((int) threadIdx.x < ne) {
++            const int e = a.grp_ptr != nullptr ? a.grp_ent[mm + threadIdx.x] : mm + threadIdx.x;
++            es[threadIdx.x] = e;
++            xr[threadIdx.x] = a.grp_ptr != nullptr ? e >> 3 : 0;
++        }
++        __syncthreads();
++        const int row = blockIdx.x * kThreads + threadIdx.x;
++        for (int i = 0; i < ne; ++i) {
++            if constexpr (!GU) {
++                if (row < a.n_embd) {
++                    const uint8_t* w = blob + a.tr[2] + (size_t) row * row_bytes_t<T>(a.n_ff);
++                    const int e = es[i];
++                    a.part[(size_t) e * a.n_embd + row] = canonical_row<T>(
++                        w, a.hq + (size_t) e * a.n_ff, a.hd + (size_t) e * (a.n_ff / 32), a.n_ff);
++                }
++            } else if (row < a.n_ff) {
++                const size_t rb = row_bytes_t<T>(a.n_embd);
++                const int e = es[i];
++                const int8_t* x = a.xq + (size_t) xr[i] * a.n_embd;
++                const float* d = a.xd + (size_t) xr[i] * (a.n_embd / 32);
++                const float g = canonical_row<T>(blob + a.tr[0] + (size_t) row * rb, x, d, a.n_embd);
++                const float u = canonical_row<T>(blob + a.tr[1] + (size_t) row * rb, x, d, a.n_embd);
++                a.h[(size_t) e * a.n_ff + row] = deterministic::swiglu(g, u, a.limit);
++            }
++        }
++    }
++}
++
++template <int T>
++void canonical_mv_launch(const Jobs& J, int nj, int max_n, cudaStream_t s) {
++    const dim3 grid((unsigned) ((max_n + kThreads - 1) / kThreads), (unsigned) nj);
++    pdl_launch(canonical_mv_kernel<T>, grid, kThreads, 0, s, J);
++}
++
++template <int T>
++void canonical_gu_launch(const Args& a, int groups, cudaStream_t s) {
++    const dim3 grid((unsigned) ((a.n_ff + kThreads - 1) / kThreads), (unsigned) groups);
++    pdl_launch(canonical_win_kernel<T, true>, grid, kThreads, 0, s, a);
++}
++
++template <int T>
++void canonical_dn_launch(const Args& a, int groups, cudaStream_t s) {
++    const dim3 grid((unsigned) ((a.n_embd + kThreads - 1) / kThreads), (unsigned) groups);
++    pdl_launch(canonical_win_kernel<T, false>, grid, kThreads, 0, s, a);
++}
++
++bool canonical_type(int type) { return deterministic::supported_type(type); }
++
+ // ---------------------------------------------------------------- the prompt sets' light experts
+ // A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
+ // in the token kernels' form: each weight sub-block decoded once and dotted with every row's int8 input (rounded per 32
+@@ -1480,7 +1582,15 @@
+     }
+ }
+ 
+-bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
++bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s, bool canonical) {
++    if (canonical) {
++        if (a.act != kActSwiglu || (a.tu != 0 && a.tg != a.tu) || !canonical_type(a.tg)) return false;
++        if (a.tg == kIQ2_XXS) canonical_gu_launch<kIQ2_XXS>(a, groups, s);
++        else if (a.tg == kIQ2_S) canonical_gu_launch<kIQ2_S>(a, groups, s);
++        else if (a.tg == kIQ3_XXS) canonical_gu_launch<kIQ3_XXS>(a, groups, s);
++        else canonical_gu_launch<kIQ3_S>(a, groups, s);
++        return cudaGetLastError() == cudaSuccess;
++    }
+     if (a.n_embd % 256 != 0 || a.n_ff % (kWarps * kGuRW) != 0) return false;
+     const dim3 grid((unsigned) (a.n_ff / (kWarps * kGuRW)), (unsigned) groups);
+     if (a.act != kActSwiglu) {   // MiniMax's swigluoai: one pass, or (gate and up of different types) two
+@@ -1504,7 +1614,15 @@
+     return true;
+ }
+ 
+-bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
++bool down(const Args& a, int groups, int ne_max, cudaStream_t s, bool canonical) {
++    if (canonical) {
++        if (!canonical_type(a.td)) return false;
++        if (a.td == kIQ2_XXS) canonical_dn_launch<kIQ2_XXS>(a, groups, s);
++        else if (a.td == kIQ2_S) canonical_dn_launch<kIQ2_S>(a, groups, s);
++        else if (a.td == kIQ3_XXS) canonical_dn_launch<kIQ3_XXS>(a, groups, s);
++        else canonical_dn_launch<kIQ3_S>(a, groups, s);
++        return cudaGetLastError() == cudaSuccess;
++    }
+     if (a.n_ff % 256 != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
+     const dim3 grid((unsigned) (a.n_embd / (kWarps * kDnRW)), (unsigned) groups);
+ #define DN_(T) dn_ne<T>(a, grid, ne_max, s)
+@@ -1838,13 +1956,17 @@
+     return true;
+ }
+ 
+-bool mv(const MvJob* jobs, int n, cudaStream_t s) {
++bool mv(const MvJob* jobs, int n, cudaStream_t s, bool canonical) {
+     // the jobs by type, up to kMaxJobs a launch
+     bool done[64] = {};
+     if (n > 64) return false;
+     for (int i = 0; i < n; ++i)
+         while (!done[i]) {
+             const int t = jobs[i].type;
++            if (canonical && !canonical_type(t)) {
++                std::fprintf(stderr, "ds4 deterministic: unsupported matrix type %s\n", name(t));
++                return false;
++            }
+             Jobs J{};
+             int nj = 0, max_n = 0, max_c = 1;
+             for (int k = i; k < n && nj < kMaxJobs; ++k) {
+@@ -1855,6 +1977,13 @@
+                 max_c = std::max(max_c, jobs[k].ncol);
+                 done[k] = true;
+             }
++            if (canonical) {
++                if (t == kIQ2_XXS) canonical_mv_launch<kIQ2_XXS>(J, nj, max_n, s);
++                else if (t == kIQ2_S) canonical_mv_launch<kIQ2_S>(J, nj, max_n, s);
++                else if (t == kIQ3_XXS) canonical_mv_launch<kIQ3_XXS>(J, nj, max_n, s);
++                else canonical_mv_launch<kIQ3_S>(J, nj, max_n, s);
++                continue;
++            }
+ #define MV_(T) mv_nc<T>(J, nj, max_n, max_c, s)
+             DS4_IQ_SWITCH_MV(t, MV_)
+ #undef MV_
+--- a/src/ds4/ds4_iq.cuh
++++ b/src/ds4/ds4_iq.cuh
+@@ -11,6 +11,8 @@
+ // entry gets the token path's bits (the same kernel, the same order).  IQ1_S / IQ1_M's +-1/8 shift of each grid value
+ // (IQ1S_DELTA, a sign a sub-block or a group of 8) rides in the integer dot: the codes are 8 g +- 1 (g in {-1, 0, 1}),
+ // the scale d / 8 - so the dot carries the int8 activations' group sums exactly.
++// DS4_DETERMINISTIC=1 is a separate Maya-S verification path: IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S take Q8_K activations, the CPU lane's
++// 256-value/eight-lane reduction and the shared scalar SwiGLU. Other types and chunked prompt sets are rejected.
+ #pragma once
+ 
+ #include <cstddef>
+@@ -69,9 +71,10 @@
+                              // the gate's sums in h first - each value the same as one pass gives
+ };
+ /// grid (n_ff / 8, groups): h of every entry (ne_max: a group's most entries).  false: a type not covered.
+-bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
++/// canonical=true: the CPU lane's Q8_K arithmetic for supported IQ types, not the default per-32/warp order.
++bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s, bool canonical = false);
+ /// grid (n_embd / 8, groups): part of every entry.
+-bool down(const Args& a, int groups, int ne_max, cudaStream_t s);
++bool down(const Args& a, int groups, int ne_max, cudaStream_t s, bool canonical = false);
+ 
+ /// The prompt path's expert sets (ds4_gguf.cu's SetK): expert i's blob at wbase + i stride owns the sorted rows
+ /// [bounds[i], bounds[i + 1]) (local row = sorted row - row0); gate / up: h16[local] = F16 swiglu over x[idx[local]]
+@@ -144,8 +147,8 @@
+     const float* bias = nullptr;
+     float alpha = 1.0f;
+ };
+-bool mv(const MvJob* jobs, int n, cudaStream_t s);
+-
++/// canonical=true: IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S only; the caller must supply Q8_K activations and scales.
++bool mv(const MvJob* jobs, int n, cudaStream_t s, bool canonical = false);
+ /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
+ /// the token / window / light kernels' codes times their scales (d s q - m), tile = the prompt tiles' loader (F32,
+ /// before their F16) - both ggml's dequantize_row_* values to the bit.  false: a type not covered.
+--- a/src/ds4/ds4_iq_cpu.cpp
++++ b/src/ds4/ds4_iq_cpu.cpp
+@@ -11,6 +11,7 @@
+ #include "ggml-common.h"
+ #include "ggml-cpu.h"
+ #include "ggml.h"
++#include "ds4_deterministic_math.hpp"
+ #endif
+ 
+ #include <algorithm>
+@@ -887,6 +888,12 @@
+ bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err) {
+     kc::NativeFmt n;
+     if (!kc::native_fmt(tg, td, n_embd, n_ff, n, err)) return false;
++    if (deterministic::enabled() &&
++        (!deterministic::supported_type(tg) || !deterministic::supported_type(td) ||
++         n.gu_act != GGML_TYPE_Q8_K || n.d_act != GGML_TYPE_Q8_K)) {
++        err = "DS4_DETERMINISTIC requires Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S experts and Q8_K activations";
++        return false;
++    }
+     f.tg = tg;
+     f.td = td;
+     f.n_embd = n_embd;
+@@ -909,7 +916,12 @@
+ 
+ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
+                     float* const* ff, int r0, int r1, float limit) {
+-    if (r1 > r0 && own_nt(f.tg, nt)) {   // (native_gu_rows_split's epilogue, on the same values)
++#if defined(STRATA_NATIVE_EXPERTS)
++    const bool canonical = deterministic::enabled();
++#else
++    const bool canonical = false;
++#endif
++    if (!canonical && r1 > r0 && own_nt(f.tg, nt)) {   // (native_gu_rows_split's epilogue, on the same values)
+         const int nr = r1 - r0;
+         thread_local std::vector<float> buf;
+         thread_local std::vector<float*> go, uo;
+@@ -929,15 +941,37 @@
+                     g = std::fmin(g, limit);
+                     u = std::fmin(std::fmax(u, -limit), limit);
+                 }
+-                ff[t][r0 + r] = (g / (1.f + std::exp(-g))) * u;
++                ff[t][r0 + r] = canonical ? deterministic::swiglu(g, u, limit) : (g / (1.f + std::exp(-g))) * u;
+             }
+         return;
+     }
++#if defined(STRATA_NATIVE_EXPERTS)
++    if (canonical) {
++        const auto dot = ggml_get_type_traits_cpu((ggml_type) f.tg)->vec_dot;
++        for (int r = r0; r < r1; ++r)
++            for (int t = 0; t < nt; ++t) {
++                float g = 0.0f, u = 0.0f;
++                dot(f.n_embd, &g, 0, gate + (size_t) r * f.gu_row, 0, act[t], 0, 1);
++                dot(f.n_embd, &u, 0, up + (size_t) r * f.gu_row, 0, act[t], 0, 1);
++                ff[t][r] = deterministic::swiglu(g, u, limit);
++            }
++        return;
++    }
++#endif
+     kc::native_gu_rows_split(native(f), gate, up, act, nt, ff, r0, r1,
+                              limit > 0.0f ? limit : std::numeric_limits<float>::infinity());
+ }
+ 
+ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1) {
++#if defined(STRATA_NATIVE_EXPERTS)
++    if (deterministic::enabled()) {
++        const auto dot = ggml_get_type_traits_cpu((ggml_type) f.td)->vec_dot;
++        for (int r = r0; r < r1; ++r)
++            for (int t = 0; t < nt; ++t)
++                dot(f.n_ff, &out[t][r], 0, down + (size_t) r * f.d_row, 0, hq[t], 0, 1);
++        return;
++    }
++#endif
+     if (r1 > r0 && own_nt(f.td, nt)) {
+         thread_local std::vector<float*> o;
+         o.resize((size_t) nt);
+--- a/src/ds4/ds4_kernels.cu
++++ b/src/ds4/ds4_kernels.cu
+@@ -1,6 +1,7 @@
+ // src/ds4/ds4_kernels.cu - DeepSeek-V4.1's device kernels (see ds4_kernels.cuh).  No fast math here: the rotary
+ // angles, the softmaxes and the roundings follow the reference's F32 arithmetic.  A window's token is blockIdx.y.
+ #include "ds4_kernels.cuh"
++#include "ds4_deterministic_math.hpp"
+ #include "ds4_pdl.cuh"
+ #include "ds4_numerics.cuh"
+ #include "ds4_q6k.cuh"
+@@ -3499,6 +3500,13 @@
+ void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {
+     if (n > 0) pdl_launch(swiglu_kernel, cdiv(n, kThreads), kThreads, 0, s, g, u, n, lim, h);
+ }
++__global__ void deterministic_swiglu_kernel(const float* g, const float* u, int n, float lim, float* h) {
++    const int i = blockIdx.x * kThreads + threadIdx.x;
++    if (i < n) h[i] = gguf::deterministic::swiglu(g[i], u[i], lim);
++}
++void swiglu_deterministic(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {
++    if (n > 0) pdl_launch(deterministic_swiglu_kernel, cdiv(n, kThreads), kThreads, 0, s, g, u, n, lim, h);
++}
+ bool swiglu_q8(const float* g, const float* u, int n, float lim, float* h, int8_t* q, float* qd, cudaStream_t s) {
+     if (n % 32 != 0 || q == nullptr || qd == nullptr) return false;
+     if (n > 0) swiglu_q8_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(g, u, n, lim, h, q, qd);
+--- a/src/ds4/ds4_kernels.cuh
++++ b/src/ds4/ds4_kernels.cuh
+@@ -137,6 +137,8 @@
+ 
+ /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
+ void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
++/// DS4_DETERMINISTIC's shared CPU/GPU scalar epilogue; the default swiglu is unchanged.
++void swiglu_deterministic(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
+ /// (DS4_DECODE_TRIM 1) swiglu, its stored values also rounded to int8 as gguf mv rounds a Q8_0 job's input: q [n],
+ /// qd [n / 32], 32-blocks of the flat array (rows of k values, k % 32 == 0, are rows of q k apart).  n % 32 == 0
+ /// (false, nothing launched, otherwise)
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -18,14 +18,20 @@
+ #include "ds4_ep.hpp"
+ 
+ #include "ds4_gguf.cuh"
++#include "ds4_deterministic_math.hpp"
+ #if defined(STRATA_USE_HIP)
+ #include "ds4_iq.cuh"
+ #endif
+ #include "ds4_gguf_cpu.hpp"
++#if defined(STRATA_NATIVE_EXPERTS)
++#include "ggml.h"
++#include "ggml-cpu.h"
++#endif
+ #include "ds4_iq.cuh"
+ #include "ds4_kernels.cuh"
+ #include "ds4_lt.hpp"
+ #include "ds4_os.hpp"
++#include "ds4_p2p.hpp"
+ #include "ds4_pcie.cuh"
+ #include "ds4_pcie.hpp"
+ #include "ds4_q6k.cuh"
+@@ -518,7 +524,7 @@
+           *glog = nullptr, *rw = nullptr, *moe_out = nullptr, *sg = nullptr, *su = nullptr, *sh = nullptr,
+           *sh_out = nullptr, *cpu_part = nullptr, *eg_x = nullptr, *eg_kv = nullptr, *logits = nullptr,
+           *freqs_win = nullptr, *freqs_comp = nullptr, *xe = nullptr, *xg = nullptr, *xu = nullptr, *xhh = nullptr,
+-          *ed = nullptr;
++          *ed = nullptr, *det_out = nullptr;
+     float* glog_a = nullptr;   // lookahead: the next two layers' gate logits on this layer's FFN input (rows 1024 apart)
+     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
+     TopkScratch tks;                                   // a window's indexer top k over long rows (topk's segments)
+@@ -956,6 +962,7 @@
+ // ------------------------------------------------------------------ the model
+ struct Model::Impl {
+     Options o;
++    std::unique_ptr<strata::ds4::p2p::PeerAccess> p2p;
+     bool ep4() const { return o.ep == 4; }
+     struct EpOwnerLayer {
+         int n_hot = 0;
+@@ -1420,7 +1427,7 @@
+     std::atomic<int> layer_of[kRing];
+     std::thread service;
+     std::atomic<bool> quit{false};
+-    bool sync_decode = std::getenv("DS4_SYNC") != nullptr;
++    bool sync_decode = std::getenv("DS4_SYNC") != nullptr || gg::deterministic::enabled();
+     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
+     // before the wait for the CPU lane - the same bits, no faster)
+     bool moe_token_path = std::getenv("DS4_MOE_TOKEN") == nullptr || std::atoi(std::getenv("DS4_MOE_TOKEN")) != 0;
+@@ -1834,11 +1841,11 @@
+     double cprof_ms[8] = {};   // (4, 5: the attention's projections, its compression and indexer; 6, 7: its q, its
+                                // sparse attention - 1 then its output's projections)
+     double hprof_ms[8] = {}, hprof_last = 0;   // (the host's time between the same marks: one GPU)
+-    void prof_mark(const Dev& d, int stage) {
++    void prof_mark_stream(const Dev& d, cudaStream_t stream, int stage) {
+         if (!prof_window && !prof_chunk) return;
+         std::lock_guard<std::mutex> lk(prof_mu);
+         if (prof_failed) return;
+-        if (prof_chunk) {
++        if (prof_chunk && stage < 8) {
+             const double now = now_ms();
+             if (hprof_last > 0) hprof_ms[stage] += now - hprof_last;
+             hprof_last = now;
+@@ -1868,7 +1875,7 @@
+             e = pool.back();
+             pool.pop_back();
+         }
+-        ce = cudaEventRecord(e, d.st);
++        ce = cudaEventRecord(e, stream);
+         if (ce != cudaSuccess) {
+             std::fprintf(stderr, "ds4: profiling disabled: cudaEventRecord on CUDA%d: %s\n", d.id,
+                          cudaGetErrorString(ce));
+@@ -1878,13 +1885,18 @@
+         }
+         prof_marks.push_back({d.id, e, stage});
+     }
++    void prof_mark(const Dev& d, int stage) {
++        prof_mark_stream(d, d.st, stage);
++    }
+     void prof_collect() {
+         if (!prof_window && !prof_chunk) return;
+         std::lock_guard<std::mutex> lk(prof_mu);
+         const bool chunk_sample = prof_chunk;
+         bool sample_ok = !prof_failed;
+-        double sample_ms[8] = {};
++        double sample_ms[11] = {}, sample_max_ms[11] = {};
+         std::vector<std::pair<int, cudaEvent_t>> last;
++        std::vector<ProfMark> stage_last;
++        std::vector<std::pair<int, std::array<double, 11>>> device_totals;
+         int current_dev = -1;
+         if (sample_ok) {
+             for (const ProfMark& m : prof_marks) {
+@@ -1903,6 +1915,30 @@
+                     }
+                     current_dev = m.dev;
+                 }
++                auto previous = std::find_if(stage_last.begin(), stage_last.end(), [&](const ProfMark& x) {
++                    return x.dev == m.dev && x.stage + 1 == m.stage;
++                });
++                auto current = std::find_if(stage_last.begin(), stage_last.end(), [&](const ProfMark& x) {
++                    return x.dev == m.dev && x.stage == m.stage;
++                });
++                if (previous != stage_last.end()) {
++                    float ms = 0.0f;
++                    const cudaError_t ce = cudaEventElapsedTime(&ms, previous->ev, m.ev);
++                    if (ce != cudaSuccess) {
++                        sample_ok = false;
++                        break;
++                    }
++                    auto device = std::find_if(device_totals.begin(), device_totals.end(), [&](const auto& x) {
++                        return x.first == m.dev;
++                    });
++                    if (device == device_totals.end()) {
++                        device_totals.push_back({m.dev, {}});
++                        device = std::prev(device_totals.end());
++                    }
++                    device->second[m.stage] += ms;
++                }
++                if (current == stage_last.end()) stage_last.push_back({m.dev, m.ev, m.stage});
++                else current->ev = m.ev;
+                 auto it = std::find_if(last.begin(), last.end(), [&](const auto& x) { return x.first == m.dev; });
+                 if (it != last.end()) {
+                     float ms = 0.0f;
+@@ -1919,10 +1955,16 @@
+                     last.push_back({m.dev, m.ev});
+                 }
+             }
++            if (sample_ok)
++                for (const auto& device : device_totals)
++                    for (int stage = 0; stage < 11; ++stage)
++                        sample_max_ms[stage] = std::max(sample_max_ms[stage], device.second[stage]);
+         }
+         if (sample_ok) {
+             double* total = chunk_sample ? cprof_ms : st.prof_ms;
+-            const int stages = chunk_sample ? 8 : 6;
++            const int stages = chunk_sample ? 8 : 11;
++            if (!chunk_sample)
++                for (int i = 0; i < stages; ++i) st.prof_max_ms[i] += sample_max_ms[i];
+             for (int i = 0; i < stages; ++i) total[i] += sample_ms[i];
+             for (const ProfMark& m : prof_marks) prof_pool[(size_t) m.dev].push_back(m.ev);
+             prof_marks.clear();
+@@ -2536,6 +2578,11 @@
+             l.lay.trellis[r] = off;
+             l.lay.suh[r] = l.lay.svh[r] = off;
+             l.lay.gg_type[r] = ty;
++            if (gg::deterministic::enabled() && !gg::deterministic::supported_type(ty)) {
++                err = P + parts[r] + ": DS4_DETERMINISTIC supports only Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, not " +
++                      gg::type_name(ty);
++                return false;
++            }
+             off += align256(bytes);
+         }
+         l.lay.fmt = gg::kFmtMXFP4;
+@@ -2963,6 +3010,16 @@
+             }
+             CK(mem_info(&d.free0, &d.total));
+         }
++        if (o.p2p) {
++            if (ids.size() < 2) {
++                err = "--p2p on requires at least two selected devices";
++                return false;
++            }
++            auto peers = std::make_unique<strata::ds4::p2p::PeerAccess>(ids);
++            if (!peers->enable_all(err)) return false;
++            p2p = std::move(peers);
++            std::fprintf(stderr, "ds4: explicit P2P peer access enabled\n");
++        }
+         // abliteration: the direction read once, a copy on every device (projected out at each hc_post: ablate())
+         if (!o.ablate.empty() && !o.vision_only) {
+             abl_scale = o.ablate_scale;
+@@ -3174,6 +3231,13 @@
+         if (dc != nullptr) chunk = prompt_par ? std::atoi(dc) : 0;
+         else if (chunk > 0 && o.prefill_chunk < 0) chunk = chunk_default(chunk);
+         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
++        if (gg::deterministic::enabled()) {
++            if (chunk > 0 || par) {
++                err = "DS4_DETERMINISTIC currently requires synchronous TP=1 windows (--prefill-chunk 0, --threads off)";
++                return false;
++            }
++            std::fprintf(stderr, "ds4: deterministic verification: IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, Q8_K and fixed CPU-lane reduction\n");
++        }
+         one_gpu_path();   // (the devices, their groups and the helper GPU known: before the recent slots' count)
+         // (a GGUF: 32 too while streamed experts land in them, DS4_LAND - the link's bytes stay in VRAM)
+         recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && (!file_experts || (pk.gguf && ln_land)) ? 32.0f : 0.0f));
+@@ -3508,6 +3572,7 @@
+                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
+                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
+                       dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err);
++            if (ok && gg::deterministic::enabled() && !ep4()) ok = dalloc(d, d.det_out, P * D, err);
+             if (!ok) return false;
+             CK(cudaMemset(d.cpu_any, 0, sizeof(int)));
+             d.attn_scr.max_t = kAttnScratchT;
+@@ -5862,6 +5927,21 @@
+         return false;
+     }
+ 
++    bool peer_copy(void* dst, const Dev& dst_device, const void* src, const Dev& src_device, size_t bytes,
++                   cudaStream_t stream, std::string& err) {
++        if (p2p == nullptr) {
++            err = "P2P transport was not initialized";
++            return false;
++        }
++        size_t enqueued = 0;
++        if (!p2p->copy_peer_async(dst, dst_device.id, src, src_device.id, bytes, stream, enqueued, err)) return false;
++        if (enqueued != bytes) {
++            err = "P2P copy byte count mismatch";
++            return false;
++        }
++        return true;
++    }
++
+     bool ep_open(std::string& err) {
+         const size_t P = (size_t) kWin * kPicks;
+         ep_workers.clear();
+@@ -5900,13 +5980,37 @@
+             err = "invalid EP4 job";
+             return false;
+         }
++        if (gg::deterministic::enabled()) {
++            const char* failed = std::getenv("DS4_EP_TEST_FAIL_RANK");
++            if (failed != nullptr && std::atoi(failed) == w.rank) {
++                err = "injected EP4 owner error at rank " + std::to_string(w.rank);
++                return false;
++            }
++            const char* stopped = std::getenv("DS4_EP_TEST_STOP_RANK");
++            if (stopped != nullptr && std::atoi(stopped) == w.rank) {
++                halt.store(true, std::memory_order_release);
++                err = "injected EP4 owner STOP at rank " + std::to_string(w.rank);
++                return false;
++            }
++            const char* delayed = std::getenv("DS4_EP_TEST_DELAY_RANK");
++            if (delayed != nullptr && std::atoi(delayed) == w.rank && j.nrows > 0) {
++                std::fprintf(stderr, "DS4_EP_TEST delay rank %d layer %d rows %d: 250 ms\n", w.rank, j.layer, j.nrows);
++                std::this_thread::sleep_for(std::chrono::milliseconds(250));
++                std::fprintf(stderr, "DS4_EP_TEST delay rank %d layer %d completed\n", w.rank, j.layer);
++            }
++        }
+         Dev& d = devs[(size_t) w.rank];
+         Layer& l = L[(size_t) j.layer];
+         const int D = g.dim;
+         cudaStream_t s = w.st;
+         CK(cudaSetDevice(d.id));
+-        if (w.rank > 0 && j.nrows > 0)
+-            CK(cudaMemcpyAsync(w.x, h_x, (size_t) j.T * D * sizeof(float), cudaMemcpyHostToDevice, s));
++        if (w.rank > 0 && j.nrows > 0) {
++            if (o.p2p) {
++                if (!peer_copy(w.x, d, devs[0].x, devs[0], (size_t) j.T * D * sizeof(float), s, err)) return false;
++            } else {
++                CK(cudaMemcpyAsync(w.x, h_x, (size_t) j.T * D * sizeof(float), cudaMemcpyHostToDevice, s));
++            }
++        }
+         if (j.nrows > 0) {
+             gather_rows(w.rank == 0 ? d.x : w.x, j.gather, j.nrows, D, w.xe, s);
+             std::vector<x3::MvJob> jobs;
+@@ -5933,8 +6037,10 @@
+                                        count, D, g.ff));
+                 });
+             }
++            if (gg::deterministic::enabled()) prof_mark_stream(d, s, 6);
+             if (!mv_n(d, s, jobs.data(), (int) jobs.size(), err, nullptr, true)) return false;
+-            swiglu(w.xg, w.xu, (size_t) j.nrows * g.ff, g.lim, w.xhh, s);
++            if (gg::deterministic::enabled()) swiglu_deterministic(w.xg, w.xu, (size_t) j.nrows * g.ff, g.lim, w.xhh, s);
++            else swiglu(w.xg, w.xu, (size_t) j.nrows * g.ff, g.lim, w.xhh, s);
+             jobs.clear();
+             for (int i = 0; i < j.nvex; ++i) {
+                 const std::array<x3::Mat, 3>* vm = views(j.vex[i]);
+@@ -5945,9 +6051,10 @@
+                 });
+             }
+             if (!mv_n(d, s, jobs.data(), (int) jobs.size(), err, nullptr, true)) return false;
++            if (gg::deterministic::enabled()) prof_mark_stream(d, s, 7);
+             if (w.rank == 0) {
+                 scatter_rows(w.ed, j.scatter, j.nrows, D, devs[0].ed, s);
+-            } else {
++            } else if (!o.p2p) {
+                 if (w.h_compact == nullptr || w.h_full == nullptr) {
+                     err = "EP4 owner has no pinned output buffers";
+                     return false;
+@@ -5962,6 +6069,7 @@
+                     return false;
+                 }
+             }
++            prof_mark_stream(d, s, 8);
+         }
+         CK(cudaEventRecord(w.ev, s));
+         return true;
+@@ -6033,7 +6141,12 @@
+     bool ep_wait(ep::Completion& completion, const std::array<bool, 4>& has_work, unsigned seq, int layer,
+                  std::string& err) {
+         std::array<bool, 4> done = {};
+-        const double deadline = now_ms() + kEpWaitMs;
++        const char* delayed = gg::deterministic::enabled() ? std::getenv("DS4_EP_TEST_DELAY_RANK") : nullptr;
++        const int delayed_rank = delayed != nullptr ? std::atoi(delayed) : -1;
++        const bool targeted_delay = delayed_rank >= 0 && delayed_rank < 4 && has_work[(size_t) delayed_rank] &&
++                                    ep_workers[(size_t) delayed_rank]->job.nrows > 0;
++        const double deadline = now_ms() + (targeted_delay ? env_f("DS4_EP_TEST_WAIT_MS", (float) kEpWaitMs)
++                                                           : (float) kEpWaitMs);
+         for (;;) {
+             if ((cancel && cancel()) || halt.load(std::memory_order_acquire))
+                 return ep_fail(err, "EP4 stopped at layer " + std::to_string(layer) + " seq " + std::to_string(seq));
+@@ -6068,22 +6181,35 @@
+                     return ep_fail(err, "EP4 rank " + std::to_string(rank) + " layer " + std::to_string(layer) +
+                                         " seq " + std::to_string(seq) + ": " + cudaGetErrorString(q));
+                 if (rank > 0 && has_work[(size_t) rank] && w.job.nrows > 0) {
+-                    if (w.h_full == nullptr) return ep_fail(err, "EP4 owner has no full pinned output buffer");
+-                    // These reads precede combine on the main stream.  The next layer's route sync completes them before
+-                    // this worker can clear h_full for its next job.
+-                    cudaSetDevice(devs[0].id);
+-                    const int D = g.dim;
+-                    for (int i = 0; i < w.job.nrows; ++i) {
+-                        const int row = w.job.scatter.src[i];
+-                        if (row < 0 || row >= w.job.T * kPicks)
+-                            return ep_fail(err, "EP4 H2D row out of range at rank " + std::to_string(rank));
+-                        // Only this owner's rows are copied: a whole-buffer copy would zero the other owners' rows.
+-                        const cudaError_t copy =
+-                            cudaMemcpyAsync(devs[0].ed + (size_t) row * D, w.h_full + (size_t) row * D,
+-                                            (size_t) D * sizeof(float), cudaMemcpyHostToDevice, devs[0].st);
+-                        if (copy != cudaSuccess)
+-                            return ep_fail(err, "EP4 host-to-main copy failed at rank " + std::to_string(rank) +
+-                                                ": " + cudaGetErrorString(copy));
++                    if (o.p2p) {
++                        const int D = g.dim;
++                        for (int i = 0; i < w.job.nrows; ++i) {
++                            const int row = w.job.scatter.src[i];
++                            if (row < 0 || row >= w.job.T * kPicks)
++                                return ep_fail(err, "EP4 P2P row out of range at rank " + std::to_string(rank));
++                            if (!peer_copy(devs[0].ed + (size_t) row * D, devs[0], w.ed + (size_t) i * D,
++                                           devs[(size_t) rank], (size_t) D * sizeof(float), devs[0].st, err))
++                                return ep_fail(err, "EP4 P2P owner return failed at rank " + std::to_string(rank) +
++                                                    ": " + err);
++                        }
++                    } else {
++                        if (w.h_full == nullptr) return ep_fail(err, "EP4 owner has no full pinned output buffer");
++                        // These reads precede combine on the main stream.  The next layer's route sync completes them before
++                        // this worker can clear h_full for its next job.
++                        cudaSetDevice(devs[0].id);
++                        const int D = g.dim;
++                        for (int i = 0; i < w.job.nrows; ++i) {
++                            const int row = w.job.scatter.src[i];
++                            if (row < 0 || row >= w.job.T * kPicks)
++                                return ep_fail(err, "EP4 H2D row out of range at rank " + std::to_string(rank));
++                            // Only this owner's rows are copied: a whole-buffer copy would zero the other owners' rows.
++                            const cudaError_t copy =
++                                cudaMemcpyAsync(devs[0].ed + (size_t) row * D, w.h_full + (size_t) row * D,
++                                                (size_t) D * sizeof(float), cudaMemcpyHostToDevice, devs[0].st);
++                            if (copy != cudaSuccess)
++                                return ep_fail(err, "EP4 host-to-main copy failed at rank " + std::to_string(rank) +
++                                                    ": " + cudaGetErrorString(copy));
++                        }
+                     }
+                 }
+                 done[(size_t) rank] = true;
+@@ -6288,6 +6414,7 @@
+     }
+ 
+     bool ep_moe(Layer& l, Dev& d, int T, bool hs, bool fuse, std::string& err) {
++        const double dispatch_started = now_ms();
+         if (!ep_broken.empty()) {
+             err = ep_broken;
+             return false;
+@@ -6307,6 +6434,15 @@
+         } catch (const std::exception& e) {
+             return ep_fail(err, std::string("EP4 routing: ") + e.what());
+         }
++        for (const ep::Pick& pick : plan.picks) {
++            if (pick.token < 0 || pick.token >= T || pick.pick < 0 || pick.pick >= l.k_exp) {
++                char detail[256];
++                std::snprintf(detail, sizeof detail,
++                              "EP4 invalid pick: layer %d T %d token %d pick %d expert %d k %d stride %d tier %d",
++                              l.il, T, pick.token, pick.pick, pick.expert, l.k_exp, kPicks, (int) pick.tier);
++                return ep_fail(err, detail);
++            }
++        }
+         ep::Completion completion(plan, 4);
+         std::array<EpJob, 4> jobs;
+         std::array<bool, 4> has_work = {};
+@@ -6324,15 +6460,25 @@
+             ++pr[e];
+             l.heat[(size_t) e] += 1.0f;
+             if (pick.tier == ep::Tier::cpu_cold) {
+-                cm.cpu[pick.token] = 1;
++                if (!gg::deterministic::enabled()) cm.cpu[pick.token] = 1;
+                 l.cpu_hits.push_back(e);
+                 continue;
+             }
+-            const int row = ep::output_row(pick, kPicks);
+-            cm.row[pick.token][cm.n[pick.token]] = row;
+-            cm.w[pick.token][cm.n[pick.token]] = pick.weight;
+-            ++cm.n[pick.token];
++            if (!gg::deterministic::enabled()) {
++                const int row = ep::output_row(pick, kPicks);
++                cm.row[pick.token][cm.n[pick.token]] = row;
++                cm.w[pick.token][cm.n[pick.token]] = pick.weight;
++                ++cm.n[pick.token];
++            }
+         }
++        if (gg::deterministic::enabled())
++            for (int t = 0; t < T; ++t) {
++                cm.n[t] = l.k_exp;
++                for (int i = 0; i < l.k_exp; ++i) {
++                    cm.row[t][i] = t * kPicks + i;
++                    cm.w[t][i] = h_w[t * kPicks + i];
++                }
++            }
+         for (const ep::Group& group : plan.groups) {
+             EpJob& j = jobs[(size_t) group.owner];
+             has_work[(size_t) group.owner] = true;
+@@ -6362,7 +6508,7 @@
+                 for (int i = 0; i < en.n; ++i) {
+                     const ep::Pick& pick = plan.picks[rows[a + (size_t) i]];
+                     en.tok[i] = pick.token;
+-                    cpu_rows.push_back({pick.token, pick.weight});
++                    cpu_rows.push_back({gg::deterministic::enabled() ? ep::output_row(pick, kPicks) : pick.token, pick.weight});
+                 }
+                 nslots += en.n;
+                 ents.push_back(en);
+@@ -6370,39 +6516,55 @@
+         }
+         st.experts += (int64_t) T * l.k_exp;
+         st.cpu_experts += nslots;
++        if (gg::deterministic::enabled()) prof_mark(d, 6);
+         for (int rank = 1; rank < 4; ++rank)
+             if (!ep_submit(*ep_workers[(size_t) rank], jobs[(size_t) rank], err))
+                 return ep_fail(err, "EP4 submit rank " + std::to_string(rank) + " layer " + std::to_string(l.il) +
+                                     " seq " + std::to_string(seq) + ": " + err);
+         if (!ep_submit(*ep_workers[0], jobs[0], err))
+             return ep_fail(err, "EP4 submit rank 0 layer " + std::to_string(l.il) + ": " + err);
++        st.ep_dispatch_ms += now_ms() - dispatch_started;
++        if (gg::deterministic::enabled() && jobs[0].nrows == 0) prof_mark(d, 7);
+         if (!ents.empty()) {
+             const double tc = now_ms();
+             cpu_experts(l, h_x, ents);
+-            std::fill(h_part, h_part + (size_t) T * D, 0.0f);
+-            for (int slot = 0; slot < nslots; ++slot) {
+-                float* out = h_part + (size_t) cpu_rows[(size_t) slot].first * D;
+-                const float weight = cpu_rows[(size_t) slot].second;
+-                const float* y = c_yd.data() + (size_t) slot * D;
+-                for (int e = 0; e < D; ++e) out[e] += weight * y[e];
++            if (gg::deterministic::enabled()) {
++                for (int slot = 0; slot < nslots; ++slot)
++                    CK(cudaMemcpyAsync(d.ed + (size_t) cpu_rows[(size_t) slot].first * D,
++                                       c_yd.data() + (size_t) slot * D, (size_t) D * sizeof(float),
++                                       cudaMemcpyHostToDevice, s));
++            } else {
++                std::fill(h_part, h_part + (size_t) T * D, 0.0f);
++                for (int slot = 0; slot < nslots; ++slot) {
++                    float* out = h_part + (size_t) cpu_rows[(size_t) slot].first * D;
++                    const float weight = cpu_rows[(size_t) slot].second;
++                    const float* y = c_yd.data() + (size_t) slot * D;
++                    for (int e = 0; e < D; ++e) out[e] += weight * y[e];
++                }
++                const cudaError_t copy =
++                    cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * sizeof(float), cudaMemcpyHostToDevice, s);
++                if (copy != cudaSuccess)
++                    return ep_fail(err, "EP4 CPU-part copy failed: " + std::string(cudaGetErrorString(copy)));
+             }
+             st.cpu_ms += now_ms() - tc;
+-            const cudaError_t copy =
+-                cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * sizeof(float), cudaMemcpyHostToDevice, s);
+-            if (copy != cudaSuccess)
+-                return ep_fail(err, "EP4 CPU-part copy failed: " + std::string(cudaGetErrorString(copy)));
+         }
++        if (gg::deterministic::enabled()) prof_mark(d, 8);
+         completion.complete_cpu();
+         main_at.store("waiting for EP4 owner events", std::memory_order_relaxed);
++        const double wait_started = now_ms();
+         if (!ep_wait(completion, has_work, seq, l.il, err)) return false;
++        st.ep_wait_ms += now_ms() - wait_started;
+         main_at.store("EP4 owner events complete", std::memory_order_relaxed);
+         if (!completion.can_combine()) return ep_fail(err, "EP4 incomplete result refused at combine");
++        if (gg::deterministic::enabled()) prof_mark(d, 9);
+         const cudaError_t main_dev = cudaSetDevice(d.id);
+         if (main_dev != cudaSuccess)
+             return ep_fail(err, "EP4 cannot restore the main device for combine: " +
+                                 std::string(cudaGetErrorString(main_dev)));
+         (void) cudaGetLastError();   // event-polling's NotReady is not a combine launch error
+-        combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
++        combine(d.ed, !gg::deterministic::enabled() && !ents.empty() ? d.cpu_part : nullptr, d.sh_out, cm, T, D,
++                d.moe_out, s);
++        if (gg::deterministic::enabled()) prof_mark(d, 10);
+         const cudaError_t launched = cudaGetLastError();
+         if (launched != cudaSuccess)
+             return ep_fail(err, "EP4 combine launch failed: " + std::string(cudaGetErrorString(launched)));
+@@ -9361,6 +9523,130 @@
+         std::fwrite(values, 4, (size_t) count, f);
+         std::fclose(f);
+     }
++    cudaError_t trace_weights(const Layer& l, const Dev& d, int expert, const std::array<x3::Mat, 3>& vm,
++                              const float* h_input, const float* gathered, cudaStream_t stream) {
++        const char* enabled = std::getenv("DS4_TRACE_WEIGHTS");
++        if (enabled == nullptr || std::atoi(enabled) != l.il) return cudaSuccess;
++        cudaError_t status = cudaSetDevice(d.id);
++        if (status != cudaSuccess) return status;
++        for (int r = 0; r < 3; ++r) {
++            const x3::Mat& m = vm[(size_t) r];
++            const size_t row = gg::type_row_bytes(m.gg_type, m.k), bytes = row * (size_t) m.n;
++            std::vector<uint8_t> device(bytes);
++            status = cudaMemcpyAsync(device.data(), m.raw, bytes, cudaMemcpyDeviceToHost, stream);
++            if (status != cudaSuccess) return status;
++            status = cudaStreamSynchronize(stream);
++            if (status != cudaSuccess) return status;
++            const uint8_t* host = mx_mat(l, expert, r);
++            size_t different = 0, first = bytes;
++            for (size_t i = 0; i < bytes; ++i)
++                if (device[i] != host[i]) {
++                    ++different;
++                    if (first == bytes) first = i;
++                }
++            std::fprintf(stderr,
++                         "DS4_WEIGHTS layer %d expert %d role %d: %s (%zu/%zu bytes, ld %d row %zu k %d n %d type %d)\n",
++                         l.il, expert, r, different == 0 ? "match" : "MISMATCH", different, bytes, m.ld, row, m.k, m.n,
++                         m.gg_type);
++            if (different != 0)
++                std::fprintf(stderr, "DS4_WEIGHTS first %zu: VRAM %02x CPU %02x\n", first, device[first], host[first]);
++        }
++        return trace_canonical(l, d, expert, vm[0], h_input, gathered, stream);
++    }
++    cudaError_t trace_canonical(const Layer& l, const Dev& d, int expert, const x3::Mat& gate,
++                                const float* h_input, const float* gathered, cudaStream_t stream) {
++        const int k = gate.k, n = gate.n;
++        std::vector<uint8_t> cpu((size_t) (k / 256) * 292);
++        ggml_cpu_init();
++        gg::iq_cpu_quant(15, h_input, k, cpu.data());
++        int8_t* q = nullptr;
++        float* scales = nullptr;
++        float* y = nullptr;
++        cudaError_t status = cudaMalloc((void**) &q, (size_t) k);
++        if (status == cudaSuccess) status = cudaMalloc((void**) &scales, (size_t) (k / 32) * sizeof(float));
++        if (status == cudaSuccess) status = cudaMalloc((void**) &y, (size_t) n * sizeof(float));
++        if (status != cudaSuccess) return status;
++        gg::act_q8k(gathered, 1, k, q, scales, stream);
++        status = cudaStreamSynchronize(stream);
++        if (status != cudaSuccess) return status;
++        std::vector<int8_t> gpu_q((size_t) k);
++        std::vector<float> gpu_d((size_t) k / 32), gpu_y((size_t) n);
++        status = cudaMemcpy(gpu_q.data(), q, (size_t) k, cudaMemcpyDeviceToHost);
++        if (status == cudaSuccess) status = cudaMemcpy(gpu_d.data(), scales, gpu_d.size() * 4, cudaMemcpyDeviceToHost);
++        if (status != cudaSuccess) return status;
++        size_t q_bad = 0, d_bad = 0, first_q = (size_t) k;
++        for (int b = 0; b < k / 256; ++b) {
++            const uint8_t* block = cpu.data() + (size_t) b * 292;
++            for (int j = 0; j < 256; ++j)
++                if (gpu_q[(size_t) b * 256 + j] != (const int8_t) block[4 + j]) {
++                    ++q_bad;
++                    if (first_q == (size_t) k) first_q = (size_t) b * 256 + j;
++                }
++            for (int j = 0; j < 8; ++j) d_bad += std::memcmp(block, &gpu_d[(size_t) b * 8 + j], 4) != 0;
++        }
++        std::vector<float> source((size_t) k);
++        status = cudaMemcpy(source.data(), gathered, (size_t) k * sizeof(float), cudaMemcpyDeviceToHost);
++        if (status != cudaSuccess) return status;
++        size_t source_bad = 0;
++        for (int i = 0; i < k; ++i) source_bad += std::memcmp(&source[(size_t) i], &h_input[(size_t) i], 4) != 0;
++        std::fprintf(stderr, "DS4_ACT layer %d expert %d: q8 mismatches %zu, scale mismatches %zu, input mismatches %zu\n",
++                     l.il, expert, q_bad, d_bad, source_bad);
++        if (first_q < (size_t) k) {
++            const int block = (int) (first_q / 256), j = (int) (first_q % 256);
++            int at = 0;
++            const float* row = h_input + (size_t) block * 256;
++            for (int i = 1; i < 256; ++i)
++                if (std::fabs(row[i]) > std::fabs(row[at])) at = i;
++            const float maximum = row[at], iscale = -127.0f / maximum, ratio = iscale * row[j];
++            uint32_t xb = 0, rb = 0;
++            std::memcpy(&xb, &row[j], 4);
++            std::memcpy(&rb, &ratio, 4);
++            std::fprintf(stderr,
++                         "DS4_ACT first %d block %d index %d: x %.17g (%08x), max %.17g, ratio %.17g (%08x), CPU q %d GPU q %d\n",
++                         (int) first_q, block, j, row[j], xb, maximum, ratio, rb, cpu[(size_t) block * 292 + 4 + j],
++                         gpu_q[first_q]);
++        }
++        gg::iq::MvJob j;
++        j.w = (const uint8_t*) gate.raw;
++        j.ld = gg::type_row_bytes(gate.gg_type, k);
++        j.type = gate.gg_type;
++        j.k = k;
++        j.n = n;
++        j.xq = q;
++        j.xd = scales;
++        j.y = y;
++        j.ycs = n;
++        const bool launched = gg::iq::mv(&j, 1, stream, true);
++        status = cudaStreamSynchronize(stream);
++        if (status != cudaSuccess) return status;
++        status = cudaMemcpy(gpu_y.data(), y, (size_t) n * 4, cudaMemcpyDeviceToHost);
++        if (status != cudaSuccess) return status;
++        const uint8_t* host = mx_mat(l, expert, 0);
++        const size_t row = gg::type_row_bytes(gate.gg_type, k);
++        size_t bad = 0, first = (size_t) n;
++        float worst = 0.0f;
++        for (int r = 0; r < n; ++r) {
++            float expected = 0.0f;
++            ggml_get_type_traits_cpu((ggml_type) gate.gg_type)->vec_dot(k, &expected, 0, host + (size_t) r * row, 0,
++                                                                       cpu.data(), 0, 1);
++            const float error = std::fabs(expected - gpu_y[(size_t) r]);
++            if (std::memcmp(&expected, &gpu_y[(size_t) r], 4) != 0) {
++                ++bad;
++                if (first == (size_t) n) first = (size_t) r;
++            }
++            worst = std::max(worst, error);
++        }
++        std::fprintf(stderr, "DS4_CANONICAL layer %d expert %d: %s (%zu/%d, max %.9g, launched %d)\n", l.il, expert,
++                     bad ? "MISMATCH" : "match", bad, n, worst, (int) launched);
++        if (bad) {
++            float expected = 0.0f;
++            ggml_get_type_traits_cpu((ggml_type) gate.gg_type)->vec_dot(k, &expected, 0, host + first * row, 0,
++                                                                       cpu.data(), 0, 1);
++            std::fprintf(stderr, "DS4_CANONICAL first row %zu: GPU %.9g CPU %.9g\n", first, gpu_y[first], expected);
++        }
++        cudaFree(q), cudaFree(scales), cudaFree(y);
++        return launched ? cudaSuccess : cudaErrorUnknown;
++    }
+     cudaError_t trace_device_io(int layer, int token, int expert, int role, const float* values, int count,
+                                 cudaStream_t stream) const {
+         const char* enabled = std::getenv("DS4_TRACE_IO");
+@@ -17344,17 +17630,31 @@
+                 const size_t nh = (size_t) T * H * D * 4, np = (size_t) T * 8 * 4, nk = (size_t) T * topk_stride() * 4,
+                              nc = (size_t) T * cand_stride() * 4;
+                 uint8_t* bb = a.bounce;
+-                CK(cudaMemcpyAsync(bb, a.h, nh, cudaMemcpyDeviceToHost, a.st));
+-                CK(cudaMemcpyAsync(bb + nh, a.pre, np, cudaMemcpyDeviceToHost, a.st));
+-                CK(cudaMemcpyAsync(bb + nh + np, a.topk, nk, cudaMemcpyDeviceToHost, a.st));
+-                CK(cudaMemcpyAsync(bb + nh + np + nk, a.cand, nc, cudaMemcpyDeviceToHost, a.st));
+-                CK(cudaEventRecord(a.ev_out, a.st));
++                if (o.p2p) {
++                    CK(cudaEventRecord(a.ev_out, a.st));
++                    CK(cudaSetDevice(b.id));
++                    CK(cudaStreamWaitEvent(b.st, a.ev_out, 0));
++                    if (!peer_copy(b.h, b, a.h, a, nh, b.st, err) || !peer_copy(b.pre, b, a.pre, a, np, b.st, err) ||
++                        !peer_copy(b.topk, b, a.topk, a, nk, b.st, err) ||
++                        !peer_copy(b.cand, b, a.cand, a, nc, b.st, err)) {
++                        err = "PP P2P stage hand-off: " + err;
++                        return false;
++                    }
++                } else {
++                    CK(cudaMemcpyAsync(bb, a.h, nh, cudaMemcpyDeviceToHost, a.st));
++                    CK(cudaMemcpyAsync(bb + nh, a.pre, np, cudaMemcpyDeviceToHost, a.st));
++                    CK(cudaMemcpyAsync(bb + nh + np, a.topk, nk, cudaMemcpyDeviceToHost, a.st));
++                    CK(cudaMemcpyAsync(bb + nh + np + nk, a.cand, nc, cudaMemcpyDeviceToHost, a.st));
++                }
++                if (!o.p2p) CK(cudaEventRecord(a.ev_out, a.st));
+                 cudaSetDevice(b.id);
+-                CK(cudaStreamWaitEvent(b.st, a.ev_out, 0));
+-                CK(cudaMemcpyAsync(b.h, bb, nh, cudaMemcpyHostToDevice, b.st));
+-                CK(cudaMemcpyAsync(b.pre, bb + nh, np, cudaMemcpyHostToDevice, b.st));
+-                CK(cudaMemcpyAsync(b.topk, bb + nh + np, nk, cudaMemcpyHostToDevice, b.st));
+-                CK(cudaMemcpyAsync(b.cand, bb + nh + np + nk, nc, cudaMemcpyHostToDevice, b.st));
++                if (!o.p2p) CK(cudaStreamWaitEvent(b.st, a.ev_out, 0));
++                if (!o.p2p) {
++                    CK(cudaMemcpyAsync(b.h, bb, nh, cudaMemcpyHostToDevice, b.st));
++                    CK(cudaMemcpyAsync(b.pre, bb + nh, np, cudaMemcpyHostToDevice, b.st));
++                    CK(cudaMemcpyAsync(b.topk, bb + nh + np, nk, cudaMemcpyHostToDevice, b.st));
++                    CK(cudaMemcpyAsync(b.cand, bb + nh + np + nk, nc, cudaMemcpyHostToDevice, b.st));
++                }
+                 cur = l.dev;
+             }
+             if (!tap(devs[(size_t) l.dev], il, T, err)) return false;
+@@ -18233,16 +18533,22 @@
+                                  h_w[t * kPicks + i]);
+                 }
+         }
+-        if (ep4()) return ep_moe(l, d, T, hs, fuse, err);
++        if (ep4()) {
++            try {
++                return ep_moe(l, d, T, hs, fuse, err);
++            } catch (const std::exception& e) {
++                return ep_fail(err, "EP4 exception at layer " + std::to_string(l.il) + ": " + e.what());
++            }
++        }
+         // the picks by expert: the VRAM ones' rows (gathered inputs, one GEMV per matrix for all their tokens), the
+         // CPU lane's entries
+         Combine cm;
+-        Gather ga;
++        Gather ga, ordered;
+         uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
+         int vex[kWin * kPicks], vrow0[kWin * kPicks], vn[kWin * kPicks];
+         int nvex = 0, nrows = 0;
+         std::vector<Ent> ents;
+-        std::vector<std::pair<int, float>> cpu_rows;   // slot -> (token, weight)
++        std::vector<std::pair<int, float>> cpu_rows;   // slot -> (token, or global row in deterministic mode; weight)
+         std::vector<std::vector<std::pair<int, int>>> per((size_t) l.n_exp);   // expert -> (token, pick)
+         for (int t = 0; t < T; ++t) {
+             cm.n[t] = 0;
+@@ -18268,11 +18574,14 @@
+                 vrow0[nvex] = nrows;
+                 vn[nvex] = (int) pe.size();
+                 for (const auto& tp : pe) {
+-                    ga.src[nrows] = tp.first;
+                     const int t = tp.first;
+-                    cm.row[t][cm.n[t]] = nrows;
+-                    cm.w[t][cm.n[t]] = h_w[t * kPicks + tp.second];
+-                    ++cm.n[t];
++                    ga.src[nrows] = t;
++                    if (gg::deterministic::enabled()) ordered.src[nrows] = t * kPicks + tp.second;
++                    else {
++                        cm.row[t][cm.n[t]] = nrows;
++                        cm.w[t][cm.n[t]] = h_w[t * kPicks + tp.second];
++                        ++cm.n[t];
++                    }
+                     ++nrows;
+                 }
+                 ++nvex;
+@@ -18283,9 +18592,11 @@
+                     en.slot0 = nslots;
+                     en.n = (int) std::min<size_t>(kc::kExl3CpuMaxN, pe.size() - a);
+                     for (int i = 0; i < en.n; ++i) {
+-                        en.tok[i] = pe[a + (size_t) i].first;
+-                        cpu_rows.push_back({pe[a + (size_t) i].first, h_w[pe[a + (size_t) i].first * kPicks + pe[a + (size_t) i].second]});
+-                        cm.cpu[en.tok[i]] = 1;
++                        const auto& tp = pe[a + (size_t) i];
++                        en.tok[i] = tp.first;
++                        const int dst = gg::deterministic::enabled() ? tp.first * kPicks + tp.second : tp.first;
++                        cpu_rows.push_back({dst, h_w[tp.first * kPicks + tp.second]});
++                        if (!gg::deterministic::enabled()) cm.cpu[en.tok[i]] = 1;
+                     }
+                     nslots += en.n;
+                     ents.push_back(en);
+@@ -18295,8 +18606,13 @@
+         st.experts += (int64_t) T * l.k_exp;
+         st.cpu_experts += nslots;
+         if (l.mtp) st.draft_experts += (int64_t) T * l.k_exp, st.draft_cpu += nslots;
++        if (gg::deterministic::enabled()) prof_mark(d, 6);
+         if (nrows > 0) {
+             gather_rows(d.x, ga, nrows, D, d.xe, s);
++            if (std::getenv("DS4_TRACE_WEIGHTS") != nullptr && std::atoi(std::getenv("DS4_TRACE_WEIGHTS")) == l.il)
++                for (int i = 0; i < nvex; ++i)
++                    CK(trace_weights(l, d, vex[i], l.vm[(size_t) vex[i]], h_x + (size_t) ga.src[vrow0[i]] * D,
++                                     d.xe + (size_t) vrow0[i] * D, s));
+             x3::MvJob j[2 * kWin * kPicks];
+             int nj = 0;
+             for (int i = 0; i < nvex; ++i) {
+@@ -18305,12 +18621,14 @@
+                 j[nj++] = job(vm[1], d.xe + (size_t) vrow0[i] * D, d.xu + (size_t) vrow0[i] * g.ff, vn[i], D, g.ff);
+             }
+             if (!mv_n(d, j, nj, err, nullptr, true)) return false;
+-            swiglu(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
++            if (gg::deterministic::enabled()) swiglu_deterministic(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
++            else swiglu(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
+             nj = 0;
+             for (int i = 0; i < nvex; ++i)
+                 j[nj++] = job(l.vm[(size_t) vex[i]][2], d.xhh + (size_t) vrow0[i] * g.ff, d.ed + (size_t) vrow0[i] * D,
+                               vn[i], g.ff, D);
+             if (!mv_n(d, j, nj, err, nullptr, true)) return false;
++            if (gg::deterministic::enabled()) prof_mark(d, 7);
+             if (std::getenv("DS4_TRACE_IO") != nullptr && std::atoi(std::getenv("DS4_TRACE_IO")) == l.il) {
+                 CK(cudaSetDevice(d.id));
+                 CK(cudaStreamSynchronize(s));
+@@ -18327,6 +18645,9 @@
+                     }
+             }
+         }
++        if (gg::deterministic::enabled() && nrows == 0) prof_mark(d, 7);
++        if (gg::deterministic::enabled() && nrows > 0) scatter_rows(d.ed, ordered, nrows, D, d.det_out, s);
++        if (gg::deterministic::enabled()) prof_mark(d, 8);
+         if (!ents.empty()) {
+             const double tc = now_ms();
+             cpu_experts(l, h_x, ents);
+@@ -18335,17 +18656,36 @@
+                     trace_expert_io(l.il, en.tok[i], en.e, 0, c_xhd.data() + (size_t) (en.slot0 + i) * g.ff, g.ff);
+                     trace_expert_io(l.il, en.tok[i], en.e, 1, c_yd.data() + (size_t) (en.slot0 + i) * D, D);
+                 }
+-            std::fill(h_part, h_part + (size_t) T * D, 0.0f);
+-            for (int sl = 0; sl < nslots; ++sl) {
+-                float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;
+-                const float wv = cpu_rows[(size_t) sl].second;
+-                const float* y = c_yd.data() + (size_t) sl * D;
+-                for (int e = 0; e < D; ++e) o[e] += wv * y[e];
++            if (gg::deterministic::enabled()) {
++                for (int sl = 0; sl < nslots; ++sl)
++                    CK(cudaMemcpyAsync(d.det_out + (size_t) cpu_rows[(size_t) sl].first * D,
++                                       c_yd.data() + (size_t) sl * D, (size_t) D * sizeof(float),
++                                       cudaMemcpyHostToDevice, s));
++            } else {
++                std::fill(h_part, h_part + (size_t) T * D, 0.0f);
++                for (int sl = 0; sl < nslots; ++sl) {
++                    float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;
++                    const float wv = cpu_rows[(size_t) sl].second;
++                    const float* y = c_yd.data() + (size_t) sl * D;
++                    for (int e = 0; e < D; ++e) o[e] += wv * y[e];
++                }
++                CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
+             }
+             st.cpu_ms += now_ms() - tc;
+-            CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
+         }
+-        combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
++        if (gg::deterministic::enabled()) prof_mark(d, 9);
++        if (gg::deterministic::enabled()) {
++            Combine ordered_cm = {};
++            for (int t = 0; t < T; ++t) {
++                ordered_cm.n[t] = l.k_exp;
++                for (int i = 0; i < l.k_exp; ++i) {
++                    ordered_cm.row[t][i] = t * kPicks + i;
++                    ordered_cm.w[t][i] = h_w[t * kPicks + i];
++                }
++            }
++            combine(d.det_out, nullptr, d.sh_out, ordered_cm, T, D, d.moe_out, s);
++        } else combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
++        if (gg::deterministic::enabled()) prof_mark(d, 10);
+         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
+         ablate(d, d.moe_out, T, s);
+         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
+--- a/src/ds4/ds4_model.hpp
++++ b/src/ds4/ds4_model.hpp
+@@ -47,6 +47,7 @@
+     // expert parallelism: 1 keeps the layer-split path; 4 is the restricted GGUF EP4 path (four expert owners, all
+     // dense weights and the only conversation on GPU 0).  It is not a layer split and never enables tensor parallelism.
+     int ep = 1;
++    bool p2p = false;                 // explicit device-to-device transport; on fails instead of silently using the host
+     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
+     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
+     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
+@@ -96,6 +97,7 @@
+     int64_t hr_maps = 0, hr_evicts = 0;     //   experts let go, fills that failed, fills left unmapped (VRAM took the
+     int64_t hr_fails = 0, hr_abandoned = 0; //   expert meanwhile)
+     double cpu_ms = 0.0, gpu_wait_ms = 0.0;   // the CPU lane's time; the host's waits for the routing
++    double ep_dispatch_ms = 0.0, ep_wait_ms = 0.0;   // planning/submission (including rank0 work), then owner waits
+     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
+     int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // consumer Engram lookups: cache hits, on-demand reads
+     int64_t eg_pf_rows = 0, eg_pf_hits = 0, eg_pf_reads = 0;   // the same accounting for the prompt prefetcher
+@@ -109,8 +111,9 @@
+     int64_t skip_switches = 0;        // ... the times it switched
+     double skip_cold = 0.0;           // ... the cold share over its window (while skipping)
+     int64_t ram_experts = 0, ram_moves = 0;   // CPU-lane experts read from the RAM tier; experts moved into it
+-    double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
+-    int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
++    double prof_ms[11] = {};         // DS4_PROF: 0..5 are the original stages; 6..10 detail deterministic experts.
++    double prof_max_ms[11] = {};     // largest per-device stage total within a token; concurrent owners are not summed.
++    int64_t prof_tokens = 0;         // profiled one-token windows on the main model
+     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this
+     // layer's FFN input), of them in the guess's top k / in all its guesses / in the guess two layers before; the picks
+     // read from the files, of them prefetched early; experts prefetched early
+--- a/src/ds4/ds4_main.cpp
++++ b/src/ds4/ds4_main.cpp
+@@ -96,7 +96,7 @@
+     std::fprintf(stderr,
+                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
+                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
+-                 "           [--tp N] [--ep 1|4] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none]\n"
++                 "           [--tp N] [--ep 1|4] [--p2p on|off] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none]\n"
+                  "           [--dspark-conf F]\n"
+                  "           [--suffix-draft N]\n"
+                  "           [--vision on|off] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
+@@ -205,6 +205,14 @@
+                  (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
+                  (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt,
+                  (long long) (s.prof_tokens - s0.prof_tokens));
++    std::fprintf(stderr, "Expert GPU per token (DS4_PROF): math %.2f ms (largest device %.2f), scatter/copy %.2f "
++                         "(largest device %.2f), cold lane + H2D / EP wait %.2f, combine %.2f ms\n",
++                 (s.prof_ms[7] - s0.prof_ms[7]) / pt, (s.prof_max_ms[7] - s0.prof_max_ms[7]) / pt,
++                 (s.prof_ms[8] - s0.prof_ms[8]) / pt, (s.prof_max_ms[8] - s0.prof_max_ms[8]) / pt,
++                 (s.prof_ms[9] - s0.prof_ms[9]) / pt, (s.prof_ms[10] - s0.prof_ms[10]) / pt);
++    if (s.ep_dispatch_ms > s0.ep_dispatch_ms || s.ep_wait_ms > s0.ep_wait_ms)
++        std::fprintf(stderr, "EP host per token: plan + submit (includes rank0 work) %.2f ms, owner wait %.2f ms\n",
++                     (s.ep_dispatch_ms - s0.ep_dispatch_ms) / pt, (s.ep_wait_ms - s0.ep_wait_ms) / pt);
+ }
+ 
+ // The drafts between two stats: each draft position (1st, 2nd, ..) - how often it was verified with every draft
+@@ -1910,6 +1918,14 @@
+             tp_arg = val("--tp");
+             o.tp = std::max(1, std::atoi(tp_arg.c_str()));
+         }
++        else if (a == "--p2p") {
++            const std::string v = val("--p2p");
++            if (v != "on" && v != "off") {
++                std::fprintf(stderr, "--p2p takes on or off\n");
++                return 2;
++            }
++            o.p2p = v == "on";
++        }
+         else if (a == "--ep") {
+             const std::string v = val("--ep");
+             if (v != "1" && v != "4") {
+--- /dev/null
++++ b/src/ds4/ds4_deterministic_math.hpp
+@@ -0,0 +1,118 @@
++#pragma once
++
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#if defined(__HIPCC__) || defined(__CUDACC__)
++#define DS4_DET_HD __host__ __device__
++#else
++#define DS4_DET_HD
++#endif
++
++namespace strata::ds4::gguf::deterministic {
++
++inline bool enabled() {
++    const char* value = std::getenv("DS4_DETERMINISTIC");
++    return value != nullptr && std::atoi(value) != 0;
++}
++
++inline bool supported_type(int type) { return type == 16 || type == 18 || type == 21 || type == 22; }
++
++DS4_DET_HD inline double add(double a, double b) {
++#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
++    return __dadd_rn(a, b);
++#else
++    volatile double result = a + b;
++    return result;
++#endif
++}
++
++DS4_DET_HD inline double sub(double a, double b) {
++#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
++    return __dsub_rn(a, b);
++#else
++    volatile double result = a - b;
++    return result;
++#endif
++}
++
++DS4_DET_HD inline double mul(double a, double b) {
++#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
++    return __dmul_rn(a, b);
++#else
++    volatile double result = a * b;
++    return result;
++#endif
++}
++
++DS4_DET_HD inline double fma(double a, double b, double c) {
++#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
++    return __fma_rn(a, b, c);
++#else
++    return std::fma(a, b, c);
++#endif
++}
++
++DS4_DET_HD inline float divide(float a, float b) {
++#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
++    return __fdiv_rn(a, b);
++#else
++    volatile float result = a / b;
++    return result;
++#endif
++}
++
++DS4_DET_HD inline float exp_negative(float x) {
++    const double y = -(double) x;
++    if (y < -745.0) return 0.0f;
++    if (y > 709.0) return __builtin_huge_valf();
++    const double log2e = 1.44269504088896340736;
++    const int n = (int) floor(fma(y, log2e, 0.5));
++    double r = sub(y, mul((double) n, 0.693147180559945286227));
++    r = sub(r, mul((double) n, 2.31904681384629956e-17));
++    constexpr double coefficients[17] = {
++        1.0,
++        1.0,
++        0.5,
++        0.166666666666666666667,
++        0.0416666666666666666667,
++        0.00833333333333333333333,
++        0.00138888888888888888889,
++        0.000198412698412698412698,
++        0.0000248015873015873015873,
++        0.00000275573192239858906526,
++        0.000000275573192239858906526,
++        0.0000000250521083854417187751,
++        0.00000000208767569878680989792,
++        0.000000000160590438368216145994,
++        0.0000000000114707455977297247139,
++        0.00000000000076471637318198164759,
++        0.0000000000000477947733238738529744,
++    };
++    double p = coefficients[16];
++#pragma unroll
++    for (int i = 15; i >= 0; --i) p = fma(p, r, coefficients[i]);
++    const int64_t bits = (int64_t) (n + 1023) << 52;
++#if defined(__HIP_DEVICE_COMPILE__) || defined(__CUDA_ARCH__)
++    return (float) mul(p, __longlong_as_double(bits));
++#else
++    double scale;
++    std::memcpy(&scale, &bits, sizeof scale);
++    return (float) mul(p, scale);
++#endif
++}
++
++DS4_DET_HD inline float swiglu(float gate, float up, float limit) {
++    if (limit > 0.0f) {
++        gate = gate > limit ? limit : gate;
++        up = up > limit ? limit : up < -limit ? -limit : up;
++    }
++    const float sigmoid = divide(gate, 1.0f + exp_negative(gate));
++    volatile float product = sigmoid * up;
++    return product;
++}
++
++}  // namespace strata::ds4::gguf::deterministic
+--- a/tests/ds4_gguf_test.cu
++++ b/tests/ds4_gguf_test.cu
+@@ -9,16 +9,19 @@
+ // (a group of two's chunk all-reduce: DS4_AR2 against the old one, then their times)
+ #include "../src/ds4/ds4_gguf.cuh"
+ #include "../src/ds4/ds4_gguf_cpu.hpp"
++#include "../src/ds4/ds4_deterministic_math.hpp"
+ #include "../src/ds4/ds4_iq.cuh"
+ #include "../src/ds4/ds4_kernels.cuh"
+ #include "../src/ds4/ds4_pcie.cuh"
+ #include "../src/ds4/ds4_q6k.cuh"
+ 
+ #include "ggml.h"   // (the low-bit types' reference values: ggml's own dequantize_row_*)
++#include "ggml-cpu.h"
+ 
+ #include <cuda_fp16.h>
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <chrono>
+ #include <cmath>
+@@ -119,7 +122,10 @@
+ // product rounded to F32 first; d = 1 / iscale), or q8_round's per 32 with DS4_IQ_Q8K=0 or k not a multiple of 256
+ std::vector<float> act_round(const float* x, int k) {
+     const char* on = std::getenv("DS4_IQ_Q8K");
+-    if ((on != nullptr && std::atoi(on) == 0) || k % 256 != 0) return q8_round(x, k);
++    const char* deterministic = std::getenv("DS4_DETERMINISTIC");
++    if ((deterministic == nullptr || std::atoi(deterministic) == 0) &&
++        ((on != nullptr && std::atoi(on) == 0) || k % 256 != 0))
++        return q8_round(x, k);
+     std::vector<float> v(k, 0.0f);
+     for (int b = 0; b < k / 256; ++b) {
+         const float* xb = x + (size_t) b * 256;
+@@ -2069,6 +2075,224 @@
+     cudaFree(dp2), cudaFree(dflag);
+     cudaFreeHost(pinned), cudaFreeHost(pull);
+ }
++int bit_differences(const std::vector<float>& got, const std::vector<float>& want, const char* label) {
++    int bad = 0, first = -1;
++    for (size_t i = 0; i < got.size(); ++i)
++        if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) {
++            ++bad;
++            if (first < 0) first = (int) i;
++        }
++    if (first >= 0) {
++        uint32_t a, b;
++        std::memcpy(&a, &got[(size_t) first], 4);
++        std::memcpy(&b, &want[(size_t) first], 4);
++        std::printf("%s: first %d GPU %.9g (%08x), CPU %.9g (%08x)\n", label, first, got[(size_t) first], a,
++                    want[(size_t) first], b);
++    }
++    std::printf("%-64s %s (%d of %zu)\n", label, bad ? "FAIL" : "bitwise OK", bad, got.size());
++    return bad;
++}
++
++void test_deterministic_math(cudaStream_t s) {
++    const std::vector<float> gate = {-10.0f, -3.0f, -1.0f, -0.5f, 0.0f, 0.5f, 1.0f, 3.0f, 10.0f};
++    const std::vector<float> up = {0.25f, -2.0f, 3.0f, 0.75f, 1.0f, -0.125f, 0.5f, -1.0f, 2.0f};
++    std::vector<float> want(gate.size());
++    for (size_t i = 0; i < gate.size(); ++i) want[i] = gg::deterministic::swiglu(gate[i], up[i], 10.0f);
++    float* dg = dev(gate);
++    float* du = dev(up);
++    float* dh = dev(std::vector<float>(gate.size(), 0.0f));
++    strata::ds4::swiglu_deterministic(dg, du, (int) gate.size(), 10.0f, dh, s);
++    CU(cudaStreamSynchronize(s));
++    const std::vector<float> got = host(dh, gate.size());
++    if (bit_differences(got, want, "deterministic SwiGLU on identical inputs")) ++g_fail;
++    for (size_t i = 0; i < got.size(); ++i)
++        if (std::memcmp(&got[i], &want[i], 4) != 0)
++            std::printf("  math[%zu] gate %.9g up %.9g GPU %.9g CPU %.9g\n", i, gate[i], up[i], got[i], want[i]);
++    cudaFree(dg), cudaFree(du), cudaFree(dh);
++}
++
++void test_deterministic_activations(cudaStream_t s) {
++    for (const auto& shape : {std::pair<int, int>{3, 1024}, {4, 5120}}) {
++        const int rows = shape.first, k = shape.second;
++        std::vector<float> x((size_t) rows * k);
++        for (auto& v : x) v = frand();
++        std::vector<uint8_t> aq((size_t) rows * (k / 256) * 292);
++        for (int r = 0; r < rows; ++r) gg::iq_cpu_quant(15, x.data() + (size_t) r * k, k, aq.data() + (size_t) r * (k / 256) * 292);
++        float* dx = dev(x);
++        int8_t* dq = dev(std::vector<int8_t>((size_t) rows * k));
++        float* dd = dev(std::vector<float>((size_t) rows * k / 32));
++        gg::act_q8k(dx, rows, k, dq, dd, s);
++        CU(cudaStreamSynchronize(s));
++        const auto q = host(dq, (size_t) rows * k);
++        const auto d = host(dd, (size_t) rows * k / 32);
++        size_t bad_q = 0, bad_d = 0;
++        for (int r = 0; r < rows; ++r)
++            for (int b = 0; b < k / 256; ++b) {
++                const uint8_t* a = aq.data() + ((size_t) r * (k / 256) + b) * 292;
++                for (int j = 0; j < 256; ++j) bad_q += q[(size_t) r * k + b * 256 + j] != (const int8_t) a[4 + j];
++                for (int j = 0; j < 8; ++j) bad_d += std::memcmp(a, &d[(size_t) r * (k / 32) + b * 8 + j], 4) != 0;
++            }
++        std::printf("deterministic Q8_K rows %d x %d: %s (%zu codes, %zu scales)\n", rows, k,
++                    bad_q + bad_d ? "FAIL" : "bitwise OK", bad_q, bad_d);
++        if (bad_q + bad_d) ++g_fail;
++        cudaFree(dx), cudaFree(dq), cudaFree(dd);
++    }
++}
++
++void test_deterministic_row(cudaStream_t s) {
++    for (int k : {256, 1024, 2304})
++        for (const auto& types : {std::pair<int, int>{gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS},
++                                  {gg::iq::kIQ2_S, gg::iq::kIQ3_S}}) {
++        QExperts Q = make_q(k, k, 1, types.first, types.second);
++        for (int type : {Q.tg, Q.td}) {
++            const int role = type == Q.tg ? 0 : 2;
++            gg::IqCpu fm;
++            std::string err;
++            if (!gg::iq_cpu_fmt(type, type, k, k, fm, err)) {
++                std::printf("row format %d: %s\n", type, err.c_str());
++                ++g_fail;
++                continue;
++            }
++            std::vector<float> x(k);
++            for (auto& v : x) v = frand();
++            std::vector<uint8_t> aq(fm.act_bytes);
++            gg::iq_cpu_quant(fm.gu_act, x.data(), k, aq.data());
++            const void* ap[1] = {aq.data()};
++            float native = 0.0f, wrapped = 0.0f;
++            ggml_get_type_traits_cpu((ggml_type) type)->vec_dot(k, &native, 0, Q.mat(0, role), 0, aq.data(), 0, 1);
++            float* output[1] = {&wrapped};
++            gg::iq_cpu_down(fm, Q.mat(0, role), ap, 1, output, 0, 1);
++            std::vector<int8_t> q(k);
++            std::vector<float> scales(k / 32);
++            for (int b = 0; b < k / 256; ++b) {
++                std::memcpy(q.data() + b * 256, aq.data() + b * 292 + 4, 256);
++                float d;
++                std::memcpy(&d, aq.data() + b * 292, sizeof d);
++                std::fill(scales.begin() + b * 8, scales.begin() + (b + 1) * 8, d);
++            }
++            int8_t* dq = dev(q);
++            float* dd = dev(scales);
++            float* dy = dev(std::vector<float>(2, 0.0f));
++            gg::iq::MvJob j;
++            j.type = type;
++            j.k = k;
++            j.n = 1;
++            j.ld = Q.rb(role);
++            j.w = Q.dev + Q.lay.trellis[role];
++            j.xq = dq;
++            j.xd = dd;
++            j.y = dy;
++            j.ycs = 1;
++            bool ok = gg::iq::mv(&j, 1, s, false);
++            j.y = dy + 1;
++            ok = gg::iq::mv(&j, 1, s, true) && ok;
++            CU(cudaStreamSynchronize(s));
++            const std::vector<float> gpu = host(dy, 2);
++            std::printf("row type %d k %d: ggml %.9g wrapper %.9g default %.9g canonical %.9g (%s)\n", type, k, native,
++                        wrapped, gpu[0], gpu[1], ok ? "launched" : "FAILED");
++            if (!ok || std::memcmp(&wrapped, &native, 4) != 0 || std::memcmp(&gpu[1], &native, 4) != 0) ++g_fail;
++            cudaFree(dq), cudaFree(dd), cudaFree(dy);
++        }
++        cudaFree(Q.dev);
++        }
++}
++
++void test_deterministic_mv(int D, int F, cudaStream_t s, int tg = gg::iq::kIQ2_XXS, int td = gg::iq::kIQ3_XXS) {
++    QExperts Q = make_q(D, F, 5, tg, td);
++    gg::IqCpu fm;
++    std::string err;
++    if (!gg::iq_cpu_fmt(Q.tg, Q.td, D, F, fm, err)) {
++        std::printf("deterministic CPU format: FAIL %s\n", err.c_str());
++        ++g_fail;
++        cudaFree(Q.dev);
++        return;
++    }
++    const int slots = 4, tokens[slots] = {0, 1, 2, 0}, experts[slots] = {4, 4, 1, 4};
++    const float lim = 10.0f;
++    std::vector<float> x((size_t) 3 * D), hc((size_t) slots * F), yc((size_t) slots * D);
++    for (auto& v : x) v = frand();
++    std::vector<std::vector<uint8_t>> aq(slots, std::vector<uint8_t>(fm.act_bytes));
++    std::vector<std::vector<uint8_t>> hq(slots, std::vector<uint8_t>(fm.h_bytes));
++    const void* ap[slots];
++    const void* hp[slots];
++    float* fp[slots];
++    float* yp[slots];
++    for (int sl = 0; sl < slots; ++sl) {
++        gg::iq_cpu_quant(fm.gu_act, x.data() + (size_t) tokens[sl] * D, D, aq[sl].data());
++        ap[sl] = aq[sl].data();
++        fp[sl] = hc.data() + (size_t) sl * F;
++        yp[sl] = yc.data() + (size_t) sl * D;
++    }
++    for (int sl = 0; sl < slots; ++sl)
++        gg::iq_cpu_gate_up(fm, Q.mat(experts[sl], 0), Q.mat(experts[sl], 1), ap + sl, 1, fp + sl, 0, F, lim);
++    for (int sl = 0; sl < slots; ++sl) {
++        gg::iq_cpu_quant(fm.d_act, hc.data() + (size_t) sl * F, F, hq[sl].data());
++        hp[sl] = hq[sl].data();
++    }
++    for (int sl = 0; sl < slots; ++sl)
++        gg::iq_cpu_down(fm, Q.mat(experts[sl], 2), hp + sl, 1, yp + sl, 0, D);
++    std::vector<float> raw_g((size_t) slots * F), raw_u((size_t) slots * F);
++    for (int sl = 0; sl < slots; ++sl)
++        for (int r = 0; r < 2; ++r)
++            for (int f = 0; f < F; ++f)
++                ggml_get_type_traits_cpu((ggml_type) Q.tg)->vec_dot(
++                    D, &(r == 0 ? raw_g : raw_u)[(size_t) sl * F + f], 0,
++                    Q.mat(experts[sl], r) + (size_t) f * Q.rb(r), 0, aq[sl].data(), 0, 1);
++    std::vector<std::array<x3::Mat, 3>> vm(slots);
++    for (int sl = 0; sl < slots; ++sl)
++        for (int r = 0; r < 3; ++r) {
++            vm[sl][r].fmt = gg::kFmtGG;
++            vm[sl][r].gg_type = r < 2 ? Q.tg : Q.td;
++            vm[sl][r].raw = Q.dev + (size_t) experts[sl] * Q.blob + Q.lay.trellis[r];
++            vm[sl][r].k = r < 2 ? D : F;
++            vm[sl][r].n = r < 2 ? F : D;
++        }
++    float* dx = dev(x);
++    float* dg = dev(std::vector<float>((size_t) slots * F));
++    float* du = dev(std::vector<float>((size_t) slots * F));
++    float* dh = dev(std::vector<float>((size_t) slots * F));
++    float* dy = dev(std::vector<float>((size_t) slots * D));
++    std::vector<x3::MvJob> jobs;
++    for (int sl : {0, 2, 3})
++        for (int r = 0; r < 2; ++r) {
++            x3::MvJob j;
++            j.m = &vm[sl][r];
++            j.xf = dx + (size_t) tokens[sl] * D;
++            j.y = (r == 0 ? dg : du) + (size_t) sl * F;
++            j.ncol = sl == 0 ? 2 : 1;
++            j.xf_cs = D;
++            j.y_cs = F;
++            jobs.push_back(j);
++        }
++    bool ok = gg::mv(jobs.data(), (int) jobs.size(), s, nullptr, true);
++    strata::ds4::swiglu_deterministic(dg, du, slots * F, lim, dh, s);
++    jobs.clear();
++    for (int sl = 0; sl < slots; ++sl) {
++        x3::MvJob j;
++        j.m = &vm[sl][2];
++        j.xf = dh + (size_t) sl * F;
++        j.y = dy + (size_t) sl * D;
++        j.y_cs = D;
++        jobs.push_back(j);
++    }
++    ok = gg::mv(jobs.data(), (int) jobs.size(), s, nullptr, true) && ok;
++    CU(cudaStreamSynchronize(s));
++    if (!ok) ++g_fail;
++    int bad = bit_differences(host(dg, (size_t) slots * F), raw_g, "deterministic raw grouped gate");
++    bad += bit_differences(host(du, (size_t) slots * F), raw_u, "deterministic raw grouped up");
++    bad += bit_differences(host(dh, (size_t) slots * F), hc, "deterministic grouped gate + shared SwiGLU");
++    bad += bit_differences(host(dy, (size_t) slots * D), yc, "deterministic grouped down (including duplicate expert)");
++    if (bad) ++g_fail;
++    gg::iq::MvJob unsupported;
++    unsupported.type = gg::iq::kIQ4_XS;
++    unsupported.k = 256;
++    unsupported.n = 1;
++    const bool rejected = !gg::iq::mv(&unsupported, 1, s, true) && !gg::iq_cpu_fmt(gg::iq::kIQ4_XS, gg::iq::kIQ3_XXS, D, F, fm, err);
++    std::printf("%-64s %s\n", "deterministic unsupported format rejected", rejected ? "ok" : "FAIL");
++    if (!rejected) ++g_fail;
++    cudaFree(dx), cudaFree(dg), cudaFree(du), cudaFree(dh), cudaFree(dy), cudaFree(Q.dev);
++}
++
+ // The low-bit experts' activations as the CPU lane rounds them (act_q8k: ggml's Q8_K, the GPU's unless DS4_IQ_Q8K=0):
+ // the int8 values and scales byte for byte the CPU lane's (iq_cpu_quant to Q8_K), ties and an all-zero block among
+ // them; then each low-bit pair's expert on the GPU (as this process's DS4_IQ_Q8K has it) against the CPU lane's
+@@ -2080,6 +2304,11 @@
+     for (int j = 0; j < 256; ++j) x[(size_t) 1 * k + j] = 0.0f;                     // (an all-zero block)
+     x[(size_t) 2 * k + 3] = 2.5f, x[(size_t) 2 * k + 9] = -2.5f;                    // (a tie: the first one's sign)
+     for (int j = 0; j < 256; ++j) x[(size_t) 3 * k + 256 + j] = 0.5f * (float) (j % 7) - 1.5f;   // (exact halves)
++    if (std::getenv("DS4_DETERMINISTIC") != nullptr && std::atoi(std::getenv("DS4_DETERMINISTIC")) != 0) {
++        std::fill(x.begin() + 4 * k, x.begin() + 5 * k, 0.0f);
++        x[(size_t) 4 * k] = -2.0f;
++        x[(size_t) 4 * k + 37] = 37.0f / 127.0f;   // ratio 18.5: nearest-even is 18
++    }
+     float* dx = dev(x);
+     int8_t* dq = dev(std::vector<int8_t>((size_t) rows * k));
+     float* dd = dev(std::vector<float>((size_t) rows * k / 32));
+@@ -2099,12 +2328,21 @@
+             for (int c = 0; c < 8; ++c) bad += std::memcmp(&cd, &d[(size_t) r * (k / 32) + b * 8 + c], 4) != 0;
+         }
+     }
++    if (std::getenv("DS4_DETERMINISTIC") != nullptr && std::atoi(std::getenv("DS4_DETERMINISTIC")) != 0 &&
++        q[(size_t) 4 * k + 37] != 18) {
++        ++bad;
++        std::printf("q8k: 18.5 nearest-even expected 18, got %d\n", q[(size_t) 4 * k + 37]);
++    }
+     if (bad) ++g_fail;
+     std::printf("%-44s %s  %zu of %d values / scales differ\n", "q8k: the GPU's Q8_K = the CPU lane's", bad ? "FAIL" : "ok  ",
+                 bad, rows * k + rows * k / 32);
+     cudaFree(dx), cudaFree(dq), cudaFree(dd);
+     const char* on = std::getenv("DS4_IQ_Q8K");
++    const bool canonical = std::getenv("DS4_DETERMINISTIC") != nullptr && std::atoi(std::getenv("DS4_DETERMINISTIC")) != 0;
+     for (const auto& pr : kQPairs) {
++        const bool supported = (pr.first == gg::iq::kIQ2_XXS && pr.second == gg::iq::kIQ3_XXS) ||
++                               (pr.first == gg::iq::kIQ2_S && pr.second == gg::iq::kIQ3_S);
++        if (canonical && !supported) continue;
+         const int D = 1024, F = 512;
+         const float lim = 10.0f;
+         QExperts Q = make_q(D, F, 1, pr.first, pr.second);
+@@ -2147,8 +2385,16 @@
+         for (int i = 0; i < D; ++i) worst = std::max(worst, std::fabs((double) yc[i] - (double) yg[i]) / mx);
+         char what[96];
+         std::snprintf(what, sizeof what, "q8k: %s/%s expert, CPU lane vs GPU (%s)", tn(pr.first), tn(pr.second),
+-                      on == nullptr || std::atoi(on) != 0 ? "Q8_K" : "per 32");
++                      canonical ? "canonical Q8_K" : on == nullptr || std::atoi(on) != 0 ? "Q8_K" : "per 32");
+         std::printf("%-56s max diff %.3g of the largest output\n", what, worst);
++        if (canonical) {
++            char label[128];
++            std::snprintf(label, sizeof label, "deterministic %s/%s token SwiGLU", tn(pr.first), tn(pr.second));
++            int bad = bit_differences(host(dh, F), hc, label);
++            std::snprintf(label, sizeof label, "deterministic %s/%s token down + combine", tn(pr.first), tn(pr.second));
++            bad += bit_differences(yg, yc, label);
++            if (bad) ++g_fail;
++        }
+         cudaFree(dpp), cudaFree(dw), cudaFree(dxs), cudaFree(dh), cudaFree(dsh), cudaFree(dout), cudaFree(Q.dev);
+     }
+ }
+@@ -2408,6 +2654,24 @@
+         bench_cpu(argc >= 3 ? std::atoi(argv[2]) : 1);
+         return 0;
+     }
++    if (argc >= 2 && std::strcmp(argv[1], "--deterministic") == 0) {
++        setenv("DS4_DETERMINISTIC", "1", 0);
++        setenv("DS4_IQ_Q8K", "0", 0);   // the mode, not this legacy switch, fixes the reference rounding
++        test_deterministic_math(s);
++        test_q8k(s);
++        test_deterministic_activations(s);
++        test_deterministic_row(s);
++        test_deterministic_mv(1024, 512, s);
++        test_deterministic_mv(1024, 512, s, gg::iq::kIQ2_S, gg::iq::kIQ3_S);
++        if (argc < 3 || std::strcmp(argv[2], "--small") != 0) {
++            test_deterministic_mv(5120, 2304, s);
++            test_deterministic_mv(5120, 2304, s, gg::iq::kIQ2_S, gg::iq::kIQ3_S);
++            test_experts_q(512, 256, gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS, s);
++            test_experts_q(512, 256, gg::iq::kIQ2_S, gg::iq::kIQ3_S, s);
++        }
++        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
++        return g_fail ? 1 : 0;
++    }
+     if (argc >= 2 && std::strcmp(argv[1], "--q8k") == 0) {   // the low-bit activations' Q8_K rounding (DS4_IQ_Q8K)
+         test_q8k(s);
+         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-﻿# Strata Engine - top-level build (P1.S1).
++# Strata Engine - top-level build (P1.S1).
+ #
+ # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
+ # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
+@@ -495,7 +495,8 @@
+   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
+                               src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+-                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp)
++                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp
++                              src/ds4/ds4_p2p.cpp src/ds4/ds4_p2p_runtime.cu)
+     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+     target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
+                           ${_strata_gpu_blas_target})

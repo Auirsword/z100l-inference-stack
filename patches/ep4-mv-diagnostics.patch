@@ -1,0 +1,14 @@
+diff --git a/src/ds4/ds4_model.cu b/src/ds4/ds4_model.cu
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -14342,6 +14342,10 @@
+     bool mv_n(Dev&, cudaStream_t s, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr) {
+         for (int a = 0; a < n; a += x3::kMaxMvJobs)
+             if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), s, pre)) {
++                const cudaError_t diagnostic = cudaGetLastError();
++                std::fprintf(stderr, "EP4 mv failure at job %d: fmt %d gg_type %d k %d n %d ncol %d xcs %zu ycs %zu xf %p y %p stream %p: %s\n",
++                             a, j[a].m->fmt, j[a].m->gg_type, j[a].m->k, j[a].m->n, j[a].ncol,
++                             j[a].xf_cs, j[a].y_cs, j[a].xf, j[a].y, (void*) s, cudaGetErrorString(diagnostic));
+                 err = "exl3 mv failed";
+                 return false;
+             }

@@ -1,0 +1,284 @@
+diff -ruN base/CMakeLists.txt work/CMakeLists.txt
+--- base/CMakeLists.txt	2026-11-03 22:11:16.000000000 +0800
++++ work/CMakeLists.txt	2026-11-04 00:53:40.038973600 +0800
+@@ -174,6 +174,8 @@
+ # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
+ target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
+ if(STRATA_BUILD_TESTS)
++  add_executable(ds4_native_canonical_test tests/ds4_native_canonical_test.cpp)
++  add_test(NAME ds4_native_canonical_test COMMAND ds4_native_canonical_test)
+   add_executable(ds4_prefill_stats_test tests/ds4_prefill_stats_test.cpp)
+   add_test(NAME ds4_prefill_stats_test COMMAND ds4_prefill_stats_test)
+   add_executable(ds4_pcie_test tests/ds4_pcie_test.cpp)
+diff -ruN base/src/ds4/ds4_deterministic_math.hpp work/src/ds4/ds4_deterministic_math.hpp
+--- base/src/ds4/ds4_deterministic_math.hpp	2026-11-03 15:16:43.000000000 +0800
++++ work/src/ds4/ds4_deterministic_math.hpp	2026-11-04 00:53:18.993791300 +0800
+@@ -12,6 +12,16 @@
+ #define DS4_DET_HD
+ #endif
+ 
++namespace strata::ds4::gguf::native_canonical {
++
++/// 0: unset or off, 1: on, -1: invalid (model loading must reject it).
++inline int parse(const char* value) {
++    if (value == nullptr || std::strcmp(value, "0") == 0) return 0;
++    return std::strcmp(value, "1") == 0 ? 1 : -1;
++}
++
++}  // namespace strata::ds4::gguf::native_canonical
++
+ namespace strata::ds4::gguf::deterministic {
+ 
+ inline bool enabled() {
+@@ -19,6 +29,11 @@
+     return value != nullptr && std::atoi(value) != 0;
+ }
+ 
++inline bool canonical_math(bool deterministic_enabled, const char* native_value) {
++    return deterministic_enabled || native_canonical::parse(native_value) == 1;
++}
++inline bool canonical_math() { return canonical_math(enabled(), std::getenv("DS4_NATIVE_CANONICAL")); }
++
+ inline bool supported_type(int type) { return type == 16 || type == 18 || type == 21 || type == 22; }
+ 
+ DS4_DET_HD inline double add(double a, double b) {
+diff -ruN base/src/ds4/ds4_gguf.cu work/src/ds4/ds4_gguf.cu
+--- base/src/ds4/ds4_gguf.cu	2026-11-03 16:31:23.000000000 +0800
++++ work/src/ds4/ds4_gguf.cu	2026-11-04 00:56:29.622415400 +0800
+@@ -301,9 +301,9 @@
+ }
+ void q8k_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
+     pdl_launch(q8k_quant_kernel, dim3((unsigned) (k / 256), (unsigned) rows), 256, 0, s, x, ldx, k, q, d,
+-               deterministic::enabled());
++               deterministic::canonical_math());
+ }
+-// the low-bit experts' activations: Q8_K's rounding (the CPU lane's; DS4_IQ_Q8K=0: q8_1's, per 32)
++// the low-bit experts' activations: Q8_K's rounding (the CPU lane's; DS4_IQ_Q8K=0: q8_1's, per 32, unless canonical_math)
+ bool iq_q8k() {
+     static const bool on = [] {
+         const char* v = std::getenv("DS4_IQ_Q8K");
+@@ -312,7 +312,7 @@
+     return on;
+ }
+ void iq_act_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
+-    if ((iq_q8k() || deterministic::enabled()) && k % 256 == 0) q8k_quant(x, ldx, rows, k, q, d, s);
++    if ((iq_q8k() || deterministic::canonical_math()) && k % 256 == 0) q8k_quant(x, ldx, rows, k, q, d, s);
+     else q8_quant(x, ldx, rows, k, q, d, s);
+ }
+ 
+@@ -1493,7 +1493,7 @@
+     }
+     if (nq > 0) q8_quant_jobs(QJ, nq, s);
+     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
+-    if (nij > 0 && !iq::mv(IJ, nij, s, expert_q8k && deterministic::enabled())) {
++    if (nij > 0 && !iq::mv(IJ, nij, s, expert_q8k && deterministic::canonical_math())) {
+         fail("mv: a low-bit job not covered");
+         return false;
+     }
+@@ -1570,8 +1570,9 @@
+         ia.xq = sc->xq;
+         ia.xd = sc->xd;
+         iq_act_quant(x, (size_t) a.n_embd, 1, a.n_embd, sc->xq, sc->xd, s);
+-        if (!iq::gate_up(ia, a.k, 1, s, deterministic::enabled())) {
+-            fail("DS4_DETERMINISTIC only supports Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S gate/up");
++        if (!iq::gate_up(ia, a.k, 1, s, deterministic::canonical_math())) {
++            fail(deterministic::enabled() ? "DS4_DETERMINISTIC only supports Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S gate/up"
++                                          : "DS4_NATIVE_CANONICAL only supports Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S gate/up");
+             return;
+         }
+         check("moe_gate_up");
+@@ -1607,8 +1608,9 @@
+         ia.part = sc->part;
+         ia.hq = sc->hq;
+         ia.hd = sc->hd;
+-        if (!iq::down(ia, a.k, 1, s, deterministic::enabled())) {
+-            fail("DS4_DETERMINISTIC only supports Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S down");
++        if (!iq::down(ia, a.k, 1, s, deterministic::canonical_math())) {
++            fail(deterministic::enabled() ? "DS4_DETERMINISTIC only supports Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S down"
++                                          : "DS4_NATIVE_CANONICAL only supports Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S down");
+             return;
+         }
+     } else {
+@@ -1671,11 +1673,11 @@
+     }
+     (mx_gu ? q8_quant : iq_act_quant)(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
+     if (mx_gu) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
+-    else if (!iq::gate_up(ia, groups, a.T, s, deterministic::enabled())) return false;
++    else if (!iq::gate_up(ia, groups, a.T, s, deterministic::canonical_math())) return false;
+     // (rows of picks not on the device: unused)
+     (mx_d ? q8_quant : iq_act_quant)(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);
+     if (mx_d) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
+-    else if (!iq::down(ia, groups, a.T, s, deterministic::enabled())) return false;
++    else if (!iq::down(ia, groups, a.T, s, deterministic::canonical_math())) return false;
+     if (a.wait_ptr != nullptr) pdl_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
+     CombArgs c{};
+     c.plan_ptr = a.plan_ptr;
+diff -ruN base/src/ds4/ds4_gguf.cuh work/src/ds4/ds4_gguf.cuh
+--- base/src/ds4/ds4_gguf.cuh	2026-11-03 10:21:32.000000000 +0800
++++ work/src/ds4/ds4_gguf.cuh	2026-11-04 00:56:29.622415400 +0800
+@@ -76,8 +76,9 @@
+     int k = 0;
+     int rows = 1;   // (DS4_HC_FUSE=2: a window's rows of x, k apart; their int8 rows k apart, scales k / 32 apart)
+ };
+-/// expert_q8k only changes supported low-bit routed-expert activations to the CPU lane's Q8_K rounding; dense and shared
+-/// matrices keep their original quantization, including when the same call contains other matrix types.
++/// expert_q8k gives supported low-bit routed-expert activations the CPU lane's Q8_K rounding; under
++/// DS4_DETERMINISTIC or DS4_NATIVE_CANONICAL their dots use the canonical reduction too. Dense and shared matrices keep
++/// their original quantization and dots, including when the same call contains other matrix types.
+ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre, bool expert_q8k = false);
+ /// The int8 rounding mv gives a kFmtQ8_0 job's one F32 input of k values (DS4_Q8_BATCH: its batched launch's, else the
+ /// per-job one's) - what the HC fuse check compares hc_split_pre_norm's against.
+diff -ruN base/src/ds4/ds4_iq.cuh work/src/ds4/ds4_iq.cuh
+--- base/src/ds4/ds4_iq.cuh	2026-11-03 15:16:43.000000000 +0800
++++ work/src/ds4/ds4_iq.cuh	2026-11-04 00:54:22.729194800 +0800
+@@ -13,6 +13,7 @@
+ // the scale d / 8 - so the dot carries the int8 activations' group sums exactly.
+ // DS4_DETERMINISTIC=1 is a separate Maya-S verification path: IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S take Q8_K activations, the CPU lane's
+ // 256-value/eight-lane reduction and the shared scalar SwiGLU. Other types and chunked prompt sets are rejected.
++// DS4_NATIVE_CANONICAL=1 selects the same arithmetic without selecting that mode's scheduling or merge path.
+ #pragma once
+ 
+ #include <cstddef>
+@@ -71,7 +72,8 @@
+                              // the gate's sums in h first - each value the same as one pass gives
+ };
+ /// grid (n_ff / 8, groups): h of every entry (ne_max: a group's most entries).  false: a type not covered.
+-/// canonical=true: the CPU lane's Q8_K arithmetic for supported IQ types, not the default per-32/warp order.
++/// canonical=true: the CPU lane's Q8_K dot arithmetic and shared scalar SwiGLU together, not the default
++/// per-32/warp order and epilogue. Both DS4_DETERMINISTIC and DS4_NATIVE_CANONICAL request this combination.
+ bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s, bool canonical = false);
+ /// grid (n_embd / 8, groups): part of every entry.
+ bool down(const Args& a, int groups, int ne_max, cudaStream_t s, bool canonical = false);
+diff -ruN base/src/ds4/ds4_iq_cpu.cpp work/src/ds4/ds4_iq_cpu.cpp
+--- base/src/ds4/ds4_iq_cpu.cpp	2026-11-03 15:16:43.000000000 +0800
++++ work/src/ds4/ds4_iq_cpu.cpp	2026-11-04 00:54:22.729194800 +0800
+@@ -888,10 +888,11 @@
+ bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err) {
+     kc::NativeFmt n;
+     if (!kc::native_fmt(tg, td, n_embd, n_ff, n, err)) return false;
+-    if (deterministic::enabled() &&
++    if (deterministic::canonical_math() &&
+         (!deterministic::supported_type(tg) || !deterministic::supported_type(td) ||
+          n.gu_act != GGML_TYPE_Q8_K || n.d_act != GGML_TYPE_Q8_K)) {
+-        err = "DS4_DETERMINISTIC requires Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S experts and Q8_K activations";
++        err = std::string(deterministic::enabled() ? "DS4_DETERMINISTIC" : "DS4_NATIVE_CANONICAL") +
++              " requires Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S experts and Q8_K activations";
+         return false;
+     }
+     f.tg = tg;
+@@ -917,7 +918,7 @@
+ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt,
+                     float* const* ff, int r0, int r1, float limit) {
+ #if defined(STRATA_NATIVE_EXPERTS)
+-    const bool canonical = deterministic::enabled();
++    const bool canonical = deterministic::canonical_math();
+ #else
+     const bool canonical = false;
+ #endif
+@@ -964,7 +965,7 @@
+ 
+ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1) {
+ #if defined(STRATA_NATIVE_EXPERTS)
+-    if (deterministic::enabled()) {
++    if (deterministic::canonical_math()) {
+         const auto dot = ggml_get_type_traits_cpu((ggml_type) f.td)->vec_dot;
+         for (int r = r0; r < r1; ++r)
+             for (int t = 0; t < nt; ++t)
+diff -ruN base/src/ds4/ds4_kernels.cuh work/src/ds4/ds4_kernels.cuh
+--- base/src/ds4/ds4_kernels.cuh	2026-11-03 13:37:43.000000000 +0800
++++ work/src/ds4/ds4_kernels.cuh	2026-11-04 00:53:40.043978700 +0800
+@@ -137,7 +137,7 @@
+ 
+ /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
+ void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
+-/// DS4_DETERMINISTIC's shared CPU/GPU scalar epilogue; the default swiglu is unchanged.
++/// DS4_DETERMINISTIC / DS4_NATIVE_CANONICAL's shared CPU/GPU scalar epilogue; the default swiglu is unchanged.
+ void swiglu_deterministic(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
+ /// (DS4_DECODE_TRIM 1) swiglu, its stored values also rounded to int8 as gguf mv rounds a Q8_0 job's input: q [n],
+ /// qd [n / 32], 32-blocks of the flat array (rows of k values, k % 32 == 0, are rows of q k apart).  n % 32 == 0
+diff -ruN base/src/ds4/ds4_model.cu work/src/ds4/ds4_model.cu
+--- base/src/ds4/ds4_model.cu	2026-11-03 22:11:15.000000000 +0800
++++ work/src/ds4/ds4_model.cu	2026-11-04 00:54:58.389967000 +0800
+@@ -2578,8 +2578,9 @@
+             l.lay.trellis[r] = off;
+             l.lay.suh[r] = l.lay.svh[r] = off;
+             l.lay.gg_type[r] = ty;
+-            if (gg::deterministic::enabled() && !gg::deterministic::supported_type(ty)) {
+-                err = P + parts[r] + ": DS4_DETERMINISTIC supports only Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, not " +
++            if (gg::deterministic::canonical_math() && !gg::deterministic::supported_type(ty)) {
++                const char* mode = gg::deterministic::enabled() ? "DS4_DETERMINISTIC" : "DS4_NATIVE_CANONICAL";
++                err = P + parts[r] + ": " + mode + " supports only Maya-S's IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, not " +
+                       gg::type_name(ty);
+                 return false;
+             }
+@@ -2909,6 +2910,12 @@
+     // ---- loading
+     bool load(const Options& opt, std::string& err) {
+         o = opt;
++        const char* native_value = std::getenv("DS4_NATIVE_CANONICAL");
++        const int native_mode = gg::native_canonical::parse(native_value);
++        if (native_mode < 0) {
++            err = std::string("DS4_NATIVE_CANONICAL=") + native_value + ": expected 0 or 1";
++            return false;
++        }
+         const double t0 = now_ms();
+         if (o.ep != 1 && o.ep != 4) {
+             err = "expert parallel takes --ep 1 or --ep 4";
+@@ -3238,6 +3245,10 @@
+             }
+             std::fprintf(stderr, "ds4: deterministic verification: IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, Q8_K and fixed CPU-lane reduction\n");
+         }
++        if (native_mode == 1)
++            std::fprintf(stderr, "ds4: DS4_NATIVE_CANONICAL=1 diagnostic candidate: canonical Q8_K routed-expert "
++                                 "token/window/grouped-mv dots and shared scalar SwiGLU on GPU and CPU cold lane; "
++                                 "native scheduling, streaming and merge unchanged\n");
+         one_gpu_path();   // (the devices, their groups and the helper GPU known: before the recent slots' count)
+         // (a GGUF: 32 too while streamed experts land in them, DS4_LAND - the link's bytes stay in VRAM)
+         recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && (!file_experts || (pk.gguf && ln_land)) ? 32.0f : 0.0f));
+@@ -6039,7 +6050,7 @@
+             }
+             if (gg::deterministic::enabled()) prof_mark_stream(d, s, 6);
+             if (!mv_n(d, s, jobs.data(), (int) jobs.size(), err, nullptr, true)) return false;
+-            if (gg::deterministic::enabled()) swiglu_deterministic(w.xg, w.xu, (size_t) j.nrows * g.ff, g.lim, w.xhh, s);
++            if (gg::deterministic::canonical_math()) swiglu_deterministic(w.xg, w.xu, (size_t) j.nrows * g.ff, g.lim, w.xhh, s);
+             else swiglu(w.xg, w.xu, (size_t) j.nrows * g.ff, g.lim, w.xhh, s);
+             jobs.clear();
+             for (int i = 0; i < j.nvex; ++i) {
+@@ -18621,7 +18632,7 @@
+                 j[nj++] = job(vm[1], d.xe + (size_t) vrow0[i] * D, d.xu + (size_t) vrow0[i] * g.ff, vn[i], D, g.ff);
+             }
+             if (!mv_n(d, j, nj, err, nullptr, true)) return false;
+-            if (gg::deterministic::enabled()) swiglu_deterministic(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
++            if (gg::deterministic::canonical_math()) swiglu_deterministic(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
+             else swiglu(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
+             nj = 0;
+             for (int i = 0; i < nvex; ++i)
+diff -ruN base/tests/ds4_native_canonical_test.cpp work/tests/ds4_native_canonical_test.cpp
+--- base/tests/ds4_native_canonical_test.cpp	1970-01-01 08:00:00.000000000 +0800
++++ work/tests/ds4_native_canonical_test.cpp	2026-11-04 00:55:18.227536400 +0800
+@@ -0,0 +1,25 @@
++#include "../src/ds4/ds4_deterministic_math.hpp"
++
++#include <cstdio>
++
++namespace gg = strata::ds4::gguf;
++#define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
++
++int main() {
++    CHECK(gg::native_canonical::parse(nullptr) == 0);
++    CHECK(gg::native_canonical::parse("0") == 0);
++    CHECK(gg::native_canonical::parse("1") == 1);
++
++    const char* invalid[] = {"", "2", "-1", "01", "true", " 1", "1 ", "0x1"};
++    for (const char* value : invalid) CHECK(gg::native_canonical::parse(value) == -1);
++
++    CHECK(!gg::deterministic::canonical_math(false, nullptr));
++    CHECK(!gg::deterministic::canonical_math(false, "0"));
++    CHECK(gg::deterministic::canonical_math(false, "1"));
++    CHECK(gg::deterministic::canonical_math(true, nullptr));
++    CHECK(gg::deterministic::canonical_math(true, "0"));
++    CHECK(gg::deterministic::canonical_math(true, "1"));
++    CHECK(!gg::deterministic::canonical_math(false, "invalid"));
++
++    std::puts("DS4_NATIVE_CANONICAL: default off, strict values and canonical dispatch passed");
++}

@@ -1,0 +1,50 @@
+diff --git a/src/ds4/ds4_model.cu b/src/ds4/ds4_model.cu
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -5965,8 +5965,8 @@
+             CK(cudaMemcpyAsync(w.x, h_x, (size_t) j.T * D * sizeof(float), cudaMemcpyHostToDevice, s));
+         if (j.nrows > 0) {
+             gather_rows(w.rank == 0 ? d.x : w.x, j.gather, j.nrows, D, w.xe, s);
+-            x3::MvJob jobs[2 * kWin * kPicks];
+-            int nj = 0;
++            std::vector<x3::MvJob> jobs;
++            jobs.reserve(2 * (size_t) j.nvex * ((kWin * kPicks + x3::kMaxMvCols - 1) / x3::kMaxMvCols));
+             auto views = [&](int e) -> const std::array<x3::Mat, 3>* {
+                 if (w.rank == 0) return l.slot[(size_t) e] >= 0 ? &l.vm[(size_t) e] : nullptr;
+                 const EpOwnerLayer& ol = w.layers[(size_t) j.layer];
+@@ -5981,20 +5981,26 @@
+                           std::to_string(j.vex[i]);
+                     return false;
+                 }
+-                jobs[nj++] = job((*vm)[0], w.xe + (size_t) j.vrow0[i] * D, w.xg + (size_t) j.vrow0[i] * g.ff,
+-                                 j.vn[i], D, g.ff);
+-                jobs[nj++] = job((*vm)[1], w.xe + (size_t) j.vrow0[i] * D, w.xu + (size_t) j.vrow0[i] * g.ff,
+-                                 j.vn[i], D, g.ff);
++                ep::for_each_chunk(j.vn[i], x3::kMaxMvCols, [&](int first, int count) {
++                    const int row = j.vrow0[i] + first;
++                    jobs.push_back(job((*vm)[0], w.xe + (size_t) row * D, w.xg + (size_t) row * g.ff,
++                                       count, D, g.ff));
++                    jobs.push_back(job((*vm)[1], w.xe + (size_t) row * D, w.xu + (size_t) row * g.ff,
++                                       count, D, g.ff));
++                });
+             }
+-            if (!mv_n(d, s, jobs, nj, err)) return false;
++            if (!mv_n(d, s, jobs.data(), (int) jobs.size(), err)) return false;
+             swiglu(w.xg, w.xu, (size_t) j.nrows * g.ff, g.lim, w.xhh, s);
+-            nj = 0;
++            jobs.clear();
+             for (int i = 0; i < j.nvex; ++i) {
+                 const std::array<x3::Mat, 3>* vm = views(j.vex[i]);
+-                jobs[nj++] = job((*vm)[2], w.xhh + (size_t) j.vrow0[i] * g.ff,
+-                                 w.ed + (size_t) j.vrow0[i] * D, j.vn[i], g.ff, D);
++                ep::for_each_chunk(j.vn[i], x3::kMaxMvCols, [&](int first, int count) {
++                    const int row = j.vrow0[i] + first;
++                    jobs.push_back(job((*vm)[2], w.xhh + (size_t) row * g.ff,
++                                       w.ed + (size_t) row * D, count, g.ff, D));
++                });
+             }
+-            if (!mv_n(d, s, jobs, nj, err)) return false;
++            if (!mv_n(d, s, jobs.data(), (int) jobs.size(), err)) return false;
+             if (w.rank == 0) {
+                 scatter_rows(w.ed, j.scatter, j.nrows, D, devs[0].ed, s);
+             } else {

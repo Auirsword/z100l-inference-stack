@@ -1,0 +1,36 @@
+--- a/src/ds4/ds4_ep.hpp
++++ b/src/ds4/ds4_ep.hpp
+@@ -105,9 +105,10 @@
+ }
+ 
+ template <typename MainHot, typename OwnerHot>
+-Plan plan_window(int tokens, int k, const int* experts, const float* weights, const Layout& layout,
++Plan plan_window(int tokens, int k, const int* experts, const float* weights, int pick_stride, const Layout& layout,
+                  MainHot main_hot, OwnerHot owner_hot) {
+-    if (tokens <= 0 || k <= 0 || tokens > 16 || k > 8) throw std::invalid_argument("EP window shape");
++    if (tokens <= 0 || k <= 0 || tokens > 16 || k > pick_stride || pick_stride > 8)
++        throw std::invalid_argument("EP window shape");
+     Plan result;
+     const size_t count = (size_t) tokens * k;
+     result.picks.reserve(count);
+@@ -115,7 +116,7 @@
+         (size_t) layout.ranks, std::vector<std::vector<size_t>>((size_t) layout.experts));
+     for (int token = 0; token < tokens; ++token) {
+         for (int pick = 0; pick < k; ++pick) {
+-            const size_t index = (size_t) token * k + pick;
++            const size_t index = (size_t) token * pick_stride + pick;
+             const int expert = experts[index];
+             const int owner = layout.owner(expert);
+             const float weight = weights[index];
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -6354,7 +6354,8 @@
+         ep::Plan plan;
+         try {
+             plan = ep::plan_window(
+-                T, l.k_exp, h_idx, h_w, layout, [&](int e) { return layout.owner(e) == 0 && l.slot[(size_t) e] >= 0; },
++                T, l.k_exp, h_idx, h_w, kPicks, layout,
++                [&](int e) { return layout.owner(e) == 0 && l.slot[(size_t) e] >= 0; },
+                 [&](int owner, int e) {
+                     return owner == 0 ? l.slot[(size_t) e] >= 0
+                                       : ep_workers[(size_t) owner]->layers[(size_t) l.il].slot[(size_t) e] >= 0;

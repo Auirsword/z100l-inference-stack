@@ -1,0 +1,32 @@
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1711,6 +1711,17 @@
+         return (n1 - start[1] + 1) / max(RATE_MIN_SPAN_S, now - start[0])
+ 
+ 
++def model_request_error(request, current):
++    model = request.get("model")
++    if not isinstance(model, str) or not model:
++        return 400, {"error": {"type": "invalid_request_error", "param": "model",
++                               "message": "model is required and must be a nonempty string"}}
++    if model != current:
++        return 404, {"error": {"type": "invalid_request_error", "param": "model", "code": "model_not_found",
++                               "message": f"model not found: {model}"}}
++    return None
++
++
+ class Service:
+     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+                  vision: Vision | None = None, sampling_defaults: dict | None = None,
+@@ -4124,6 +4135,11 @@
+                 req = json.loads(self._body() or b"{}")
+                 if not isinstance(req, dict):
+                     raise ValueError("the request body must be a JSON object")
++                if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
++                    error = model_request_error(req, svc.model)
++                    if error is not None:
++                        self._json(error[0], error[1])
++                        return
+                 if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
+                     self._json(200, svc.count_tokens(req))
+                     return

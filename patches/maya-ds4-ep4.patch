@@ -1,0 +1,1178 @@
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -15,6 +15,7 @@
+ #include "ds4_cpu_exl3.hpp"
+ #include "ds4_ablate.hpp"
+ #include "ds4_engram_io.hpp"
++#include "ds4_ep.hpp"
+ 
+ #include "ds4_gguf.cuh"
+ #if defined(STRATA_USE_HIP)
+@@ -828,7 +829,7 @@
+     x3::MixedLayouts mix;
+     int n_vram = 0;
+     uint8_t* vram_base = nullptr;
+-    std::vector<int> slot;                      // expert -> VRAM slot or -1
++    std::vector<int> slot;                      // expert -> local VRAM slot or -1 (EP4: main-hot only, not owner-hot)
+     std::vector<int> ram;                       // expert -> RAM-tier slot or -1 (a GGUF's in-place experts; empty: none)
+     std::vector<uint8_t*> host;                 // expert -> host (non-null: on the CPU lane; its halves in hh)
+     std::vector<uint8_t*> helper;               // expert -> its blob in the helper GPU's pool (DS4_HELPER), or null:
+@@ -1011,6 +1012,43 @@
+ // ------------------------------------------------------------------ the model
+ struct Model::Impl {
+     Options o;
++    bool ep4() const { return o.ep == 4; }
++    struct EpOwnerLayer {
++        int n_hot = 0;
++        uint8_t* base = nullptr;
++        std::vector<int> slot;                       // global expert -> this owner's local slot (never Layer::slot)
++        std::vector<std::array<x3::Mat, 3>> vm;      // only this owner's 96 experts, cold ones empty
++    };
++    struct EpJob {
++        int rank = 0, layer = -1, T = 0;
++        unsigned seq = 0;
++        int nvex = 0, nrows = 0;
++        int vex[kWin * kPicks] = {}, vrow0[kWin * kPicks] = {}, vn[kWin * kPicks] = {};
++        Gather gather, scatter;
++    };
++    struct EpWorker {
++        int rank = 0, dev = 0;
++        cudaStream_t st = nullptr;
++        cudaEvent_t ev = nullptr;
++        float *x = nullptr, *xe = nullptr, *xg = nullptr, *xu = nullptr, *xhh = nullptr, *ed = nullptr;
++        float *h_compact = nullptr, *h_full = nullptr;   // rank > 0: pinned unweighted rows, then global-row staging
++        std::vector<EpOwnerLayer> layers;
++        EpJob job;
++        std::thread th;
++        std::mutex mu;
++        std::condition_variable cv;
++        bool busy = false, quit = false;
++        unsigned recorded = 0;
++        std::string error;
++        std::atomic<int> at_layer{-1};
++        std::atomic<unsigned> at_seq{0};
++        std::atomic<const char*> at{"idle"};
++    };
++    std::vector<std::unique_ptr<EpWorker>> ep_workers;
++    unsigned ep_seq = 0;
++    bool ep_keep = false;             // an unfinished owner may still touch its memory: retain it at teardown
++    std::string ep_broken;
++    static constexpr double kEpWaitMs = 30000.0;
+     // abliteration (ds4_ablate.hpp): the direction on the host, its scale, the start-up line describing it
+     std::vector<float> abl_dir;
+     float abl_scale = 0.0f;
+@@ -1085,6 +1123,14 @@
+             char b[256];
+             std::snprintf(b, sizeof b, "; CUDA%d: %s (chunk %d, layer %d)", devs[di].id, c.at.load(std::memory_order_relaxed),
+                           c.at_k.load(std::memory_order_relaxed), c.at_il.load(std::memory_order_relaxed));
++            s += b;
++        }
++        for (const auto& wp : ep_workers) {
++            const EpWorker& w = *wp;
++            char b[192];
++            std::snprintf(b, sizeof b, "; EP rank %d/CUDA%d: %s (layer %d, seq %u)", w.rank, w.dev,
++                          w.at.load(std::memory_order_relaxed), w.at_layer.load(std::memory_order_relaxed),
++                          w.at_seq.load(std::memory_order_relaxed));
+             s += b;
+         }
+         return s;
+@@ -1968,6 +2014,7 @@
+     }
+ 
+     ~Impl() {
++        ep_close();
+         {
+             std::lock_guard<std::mutex> lk(cs_mu);
+             cs_quit = true;
+@@ -2026,13 +2073,15 @@
+             if (i < zc_chunk.size() && zc_chunk[i]) cudaHostUnregister(ram_chunks[i]);
+             os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
+         }
+-        for (size_t di = 0; di < prof_pool.size(); ++di) {
+-            if (cudaSetDevice((int) di) != cudaSuccess) continue;
+-            for (cudaEvent_t e : prof_pool[di]) (void) cudaEventDestroy(e);
+-        }
+-        for (const ProfMark& m : prof_marks) {
+-            if (m.dev < 0 || (size_t) m.dev >= prof_pool.size()) continue;
+-            if (cudaSetDevice(m.dev) == cudaSuccess) (void) cudaEventDestroy(m.ev);
++        if (!ep_keep) {
++            for (size_t di = 0; di < prof_pool.size(); ++di) {
++                if (cudaSetDevice((int) di) != cudaSuccess) continue;
++                for (cudaEvent_t e : prof_pool[di]) (void) cudaEventDestroy(e);
++            }
++            for (const ProfMark& m : prof_marks) {
++                if (m.dev < 0 || (size_t) m.dev >= prof_pool.size()) continue;
++                if (cudaSetDevice(m.dev) == cudaSuccess) (void) cudaEventDestroy(m.ev);
++            }
+         }
+         {
+             std::lock_guard<std::mutex> lk(rc_mu);
+@@ -2040,12 +2089,13 @@
+         rc_cv.notify_all();
+         if (rc_th.joinable()) rc_th.join();
+         for (Dev& d : devs) {
++            if (ep_keep) continue;   // an EP timeout leaves the device work and all memory it can touch retained
+             cudaSetDevice(d.id);
+             for (void* p : d.allocs) cudaFree(p);
+             if (d.st) cudaStreamDestroy(d.st);
+             if (d.ev) cudaEventDestroy(d.ev);
+         }
+-        if (!helper_keep)
++        if (!helper_keep && !ep_keep)
+             for (void* p : host_allocs) cudaFreeHost(p);
+         for (Layer& l : L)
+             for (uint8_t* b : l.host)
+@@ -2869,6 +2919,10 @@
+     bool load(const Options& opt, std::string& err) {
+         o = opt;
+         const double t0 = now_ms();
++        if (o.ep != 1 && o.ep != 4) {
++            err = "expert parallel takes --ep 1 or --ep 4";
++            return false;
++        }
+         if (!pk.load(o.pack, err)) return false;
+         // (AMD: the prompt GEMMs' measured kernels) the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's file - empty: none,
+         // each start measures its own and keeps them to itself (a pack that must not change: a run's own store instead)
+@@ -2885,6 +2939,38 @@
+                   std::to_string(g.ix_hd) + ", experts per token " + std::to_string(g.k_exp) + ")";
+             return false;
+         }
++        if (ep4()) {
++            const char* sync = std::getenv("DS4_SYNC");
++            ep::Config c;
++            c.gguf = pk.gguf;
++            c.layers = g.nl;
++            c.experts = g.n_exp;
++            c.top_k = g.k_exp;
++            c.tp = o.tp;
++            c.seqs = o.seqs;
++            c.prefill_chunk = o.prefill_chunk;
++            c.dspark = o.dspark;
++            c.vision = o.vision;
++            c.threads = o.threads;
++            c.sync = sync != nullptr && std::strcmp(sync, "1") == 0;
++            c.gpus = o.gpus;
++            if (!ep::validate_ep4(c, err) || o.vision_only) {
++                if (o.vision_only) err = "EP4 does not run the vision-only path";
++                return false;
++            }
++            for (const char* shared : {"w1", "w2", "w3"})
++                if (pk.get(std::string("layers.0.ffn.shared_experts.") + shared + ".weight") == nullptr) {
++                    err = std::string("EP4 requires the shared expert (layers.0.ffn.shared_experts.") + shared +
++                          ".weight is missing)";
++                    return false;
++                }
++            if (ds4_env("DS4_HELPER") != nullptr || std::getenv("DS4_SPLIT") != nullptr ||
++                (std::getenv("DS4_CHUNK") != nullptr && std::atoi(std::getenv("DS4_CHUNK")) != 0) || ram_tier ||
++                copy_swap || disk_skip_w > 0.0f || ram_skip_w > 0.0f) {
++                err = "EP4 rejects helper GPUs, layer-split/chunk overrides, RAM-tier/copy swaps and expert skipping";
++                return false;
++            }
++        }
+         freqs_win = rope_freqs(g.rd, 0, g.rope_theta, g.factor, g.beta_fast, g.beta_slow);
+         freqs_comp = rope_freqs(g.rd, g.orig_ctx, g.comp_theta, g.factor, g.beta_fast, g.beta_slow);
+ 
+@@ -2897,6 +2983,10 @@
+         std::vector<int> ids = o.gpus;
+         if (ids.empty())
+             for (int i = 0; i < ndev; ++i) ids.push_back(i);
++        if (ep4() && ndev < 4) {
++            err = "EP4 requires CUDA devices 0,1,2,3";
++            return false;
++        }
+         if (!helper_parse(ndev, ids, err)) return false;   // (DS4_HELPER: off the layer devices before any of them)
+         if (const char* v = ds4_env("DS4_WARM_CAP_GB")) warm_cap = std::max(0.0, std::atof(v)) * 1e9;
+         devs.resize(ids.size());
+@@ -2915,14 +3005,17 @@
+                 cudaGetLastError();
+                 greatest = 0;
+             }
++            const bool owner_only = ep4() && i > 0;
+             CK(cudaStreamCreateWithPriority(&d.st, cudaStreamNonBlocking, greatest));
+             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
+-            CK(cudaStreamCreateWithPriority(&d.st2, cudaStreamNonBlocking, greatest));
+-            CK(cudaEventCreateWithFlags(&d.hc_go, cudaEventDisableTiming));
+-            CK(cudaEventCreateWithFlags(&d.hc_done, cudaEventDisableTiming));
+-            if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
+-                err = "exl3 scratch on CUDA" + std::to_string(d.id);
+-                return false;
++            if (!owner_only) {
++                CK(cudaStreamCreateWithPriority(&d.st2, cudaStreamNonBlocking, greatest));
++                CK(cudaEventCreateWithFlags(&d.hc_go, cudaEventDisableTiming));
++                CK(cudaEventCreateWithFlags(&d.hc_done, cudaEventDisableTiming));
++                if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
++                    err = "exl3 scratch on CUDA" + std::to_string(d.id);
++                    return false;
++                }
+             }
+             CK(mem_info(&d.free0, &d.total));
+         }
+@@ -2936,6 +3029,7 @@
+                 return false;
+             }
+             for (Dev& d : devs) {
++                if (ep4() && &d != &devs[0]) continue;
+                 if (!dalloc(d, d.abl_r, abl_dir.size(), err)) return false;
+                 CK(cudaSetDevice(d.id));
+                 CK(cudaMemcpy(d.abl_r, abl_dir.data(), abl_dir.size() * sizeof(float), cudaMemcpyHostToDevice));
+@@ -3345,6 +3439,15 @@
+             }
+             head_dev = L[(size_t) g.nl - 1].dev;
+             d_dev = g.n_mtp > 0 ? L[(size_t) g.nl].dev : 0;
++            if (ep4()) {
++                for (Layer& l : L) {
++                    l.grp = 0;
++                    l.dev = 0;
++                    l.nm = 1;
++                }
++                head_dev = 0;
++                d_dev = 0;
++            }
+         }
+         // the groups' members: copies of each layer's device state, a member's part of an expert
+         for (Layer& l : L) {
+@@ -3432,6 +3535,7 @@
+ 
+         // per device: the scratch, the caches, the dense weights
+         for (size_t di = 0; di < devs.size(); ++di) {
++            if (ep4() && di > 0) continue;   // EP owners get only their expert views and EpWorker scratch below
+             Dev& d = devs[di];
+             const int D = g.dim, H = g.hc;
+             const size_t W = kWin, P = (size_t) kWin * kPicks, cap = (size_t) o.max_context + 64;
+@@ -3856,9 +3960,12 @@
+         }
+         // the experts: VRAM slots in what each device has left (after the PCIe lane's staging slots), the rest on the host
+         if (!lane_alloc(err)) return false;
+-        if (!place_experts(err)) return false;
++        if (ep4()) {
++            if (!place_ep4(err)) return false;
++        } else if (!place_experts(err)) return false;
+         if (helper_id >= 0 && !helper_select(err)) return false;
+         if (!load_experts(err)) return false;
++        if (ep4() && !load_ep4_owners(err)) return false;
+         if (copy_swap && copy_mode) {   // (DS4_COPY_SWAP: after the copies)
+             if (const char* v = cs_env("COPY_SWAP_MARGIN")) cs_margin = (float) std::atof(v);
+             if (const char* v = cs_env("COPY_SWAP_EVERY")) cs_every = std::max(1, std::atoi(v));
+@@ -4060,7 +4167,7 @@
+                 idle_win[di].store(0u);
+             }
+         }
+-        if (o.expert_cache) {
++        if (o.expert_cache && !ep4()) {   // EP4's owner-hot sets are fixed; there is no hidden main-slot cache swap
+             size_t maxb = 0;
+             for (const Layer& l : L) maxb = std::max(maxb, l.blob);
+             const int nt = std::max(1, std::min(c_inflight, std::getenv("DS4_CACHE_THREADS") ? std::atoi(std::getenv("DS4_CACHE_THREADS"))
+@@ -5518,11 +5625,10 @@
+         return true;
+     }
+ 
+-    void set_vm(Layer& l, int e, int slot) {
+-        uint8_t* b = sat(l, l, slot, l.blob);
++    void set_vm_view(const Layer& l, int e, uint8_t* b, std::array<x3::Mat, 3>& vm) {
+         if (l.lay.fmt == gg::kFmtMXFP4) {
+             for (int r = 0; r < 3; ++r) {
+-                x3::Mat& m = l.vm[(size_t) e][(size_t) r];
++                x3::Mat& m = vm[(size_t) r];
+                 m = x3::Mat{};
+                 m.gg_type = gg::expert_type(l.lay, r);   // (a low-bit type: its GEMV, ds4_iq's)
+                 m.fmt = m.gg_type == gg::kTypeMXFP4 ? gg::kFmtMXFP4 : gg::kFmtGG;
+@@ -5534,7 +5640,7 @@
+         }
+         const x3::ExpertLayout& lay = l.n_cls > 1 ? l.clay[l.cls[(size_t) e]] : l.lay;   // (a mixed layer: its class's)
+         for (int r = 0; r < 3; ++r) {
+-            x3::Mat& m = l.vm[(size_t) e][(size_t) r];
++            x3::Mat& m = vm[(size_t) r];
+             m.trellis = (const uint32_t*) (b + lay.trellis[r]);
+             m.suh = (const uint16_t*) (b + lay.suh[r]);
+             m.svh = (const uint16_t*) (b + lay.svh[r]);
+@@ -5544,6 +5650,9 @@
+             m.cb = 2;
+             m.ld = 0;
+         }
++    }
++    void set_vm(Layer& l, int e, int slot) {
++        set_vm_view(l, e, sat(l, l, slot, l.blob), l.vm[(size_t) e]);
+     }
+     // an expert's VRAM blob -> its CPU-lane part X, and its NH parts -> the blob (the cache's swaps)
+     void blob_to_part(const Layer& l, const uint8_t* blob, int X, uint8_t* dst) const {
+@@ -5774,6 +5883,593 @@
+                 draft_vram.clear();
+                 return false;
+             }
++        }
++        return true;
++    }
++
++    void ep_close() {
++        for (auto& wp : ep_workers) {
++            EpWorker& w = *wp;
++            if (w.rank == 0) continue;
++            {
++                std::lock_guard<std::mutex> lk(w.mu);
++                w.quit = true;
++            }
++            w.cv.notify_all();
++        }
++        for (auto& wp : ep_workers)
++            if (wp->th.joinable()) wp->th.join();
++        for (auto& wp : ep_workers) {
++            EpWorker& w = *wp;
++            if (ep_keep) continue;
++            cudaSetDevice(devs[(size_t) w.rank].id);
++            if (w.st != nullptr) (void) cudaStreamSynchronize(w.st);
++            if (w.ev != nullptr) (void) cudaEventDestroy(w.ev);
++            if (w.rank > 0 && w.st != nullptr) (void) cudaStreamDestroy(w.st);
++            w.ev = nullptr;
++            if (w.rank > 0) w.st = nullptr;
++        }
++    }
++
++    bool ep_fail(std::string& err, const std::string& what) {
++        if (ep_broken.empty()) ep_broken = what;
++        ep_keep = true;   // cudaEventQuery cannot prove that the other owners stopped; never free under their work
++        err = what;
++        return false;
++    }
++
++    bool ep_open(std::string& err) {
++        const size_t P = (size_t) kWin * kPicks;
++        ep_workers.clear();
++        ep_workers.reserve(4);
++        for (int rank = 0; rank < 4; ++rank) {
++            ep_workers.push_back(std::make_unique<EpWorker>());
++            EpWorker& w = *ep_workers.back();
++            w.rank = rank;
++            w.dev = devs[(size_t) rank].id;
++            Dev& d = devs[(size_t) rank];
++            CK(cudaSetDevice(d.id));
++            if (rank == 0) w.st = d.st;
++            else CK(cudaStreamCreateWithFlags(&w.st, cudaStreamNonBlocking));
++            CK(cudaEventCreateWithFlags(&w.ev, cudaEventDisableTiming));
++            if (rank > 0) {
++                if (!x3::prepare(w.st) || !gg::prepare(w.st)) {
++                    err = "EP4 expert scratch on CUDA" + std::to_string(d.id);
++                    return false;
++                }
++                w.layers.resize(L.size());
++                if (!halloc(w.h_compact, P * g.dim, err) || !halloc(w.h_full, P * g.dim, err)) return false;
++            }
++            if (!dalloc(d, w.x, (size_t) kWin * g.dim, err) || !dalloc(d, w.xe, P * g.dim, err) ||
++                !dalloc(d, w.xg, P * g.ff, err) || !dalloc(d, w.xu, P * g.ff, err) ||
++                !dalloc(d, w.xhh, P * g.ff, err) || !dalloc(d, w.ed, P * g.dim, err))
++                return false;
++        }
++        return true;
++    }
++
++    bool ep_run(EpWorker& w, std::string& err) {
++        const EpJob& j = w.job;
++        if (j.rank != w.rank || j.layer < 0 || (size_t) j.layer >= L.size() || j.T < 1 || j.T > kWin ||
++            j.nrows < 0 || j.nrows > kWin * kPicks || j.nvex < 0 || j.nvex > kWin * kPicks ||
++            (j.nrows == 0) != (j.nvex == 0) || w.st == nullptr || w.ev == nullptr) {
++            err = "invalid EP4 job";
++            return false;
++        }
++        Dev& d = devs[(size_t) w.rank];
++        Layer& l = L[(size_t) j.layer];
++        const int D = g.dim;
++        cudaStream_t s = w.st;
++        CK(cudaSetDevice(d.id));
++        if (w.rank > 0 && j.nrows > 0)
++            CK(cudaMemcpyAsync(w.x, h_x, (size_t) j.T * D * sizeof(float), cudaMemcpyHostToDevice, s));
++        if (j.nrows > 0) {
++            gather_rows(w.rank == 0 ? d.x : w.x, j.gather, j.nrows, D, w.xe, s);
++            x3::MvJob jobs[2 * kWin * kPicks];
++            int nj = 0;
++            auto views = [&](int e) -> const std::array<x3::Mat, 3>* {
++                if (w.rank == 0) return l.slot[(size_t) e] >= 0 ? &l.vm[(size_t) e] : nullptr;
++                const EpOwnerLayer& ol = w.layers[(size_t) j.layer];
++                const int local = e - w.rank * (l.n_exp / 4);
++                return local >= 0 && local < (int) ol.vm.size() && ol.slot[(size_t) e] >= 0 ? &ol.vm[(size_t) local]
++                                                                                           : nullptr;
++            };
++            for (int i = 0; i < j.nvex; ++i) {
++                const std::array<x3::Mat, 3>* vm = views(j.vex[i]);
++                if (vm == nullptr || j.vrow0[i] < 0 || j.vn[i] <= 0 || j.vrow0[i] + j.vn[i] > j.nrows) {
++                    err = "EP4 owner/view mismatch at layer " + std::to_string(j.layer) + " expert " +
++                          std::to_string(j.vex[i]);
++                    return false;
++                }
++                jobs[nj++] = job((*vm)[0], w.xe + (size_t) j.vrow0[i] * D, w.xg + (size_t) j.vrow0[i] * g.ff,
++                                 j.vn[i], D, g.ff);
++                jobs[nj++] = job((*vm)[1], w.xe + (size_t) j.vrow0[i] * D, w.xu + (size_t) j.vrow0[i] * g.ff,
++                                 j.vn[i], D, g.ff);
++            }
++            if (!mv_n(d, s, jobs, nj, err)) return false;
++            swiglu(w.xg, w.xu, (size_t) j.nrows * g.ff, g.lim, w.xhh, s);
++            nj = 0;
++            for (int i = 0; i < j.nvex; ++i) {
++                const std::array<x3::Mat, 3>* vm = views(j.vex[i]);
++                jobs[nj++] = job((*vm)[2], w.xhh + (size_t) j.vrow0[i] * g.ff,
++                                 w.ed + (size_t) j.vrow0[i] * D, j.vn[i], g.ff, D);
++            }
++            if (!mv_n(d, s, jobs, nj, err)) return false;
++            if (w.rank == 0) {
++                scatter_rows(w.ed, j.scatter, j.nrows, D, devs[0].ed, s);
++            } else {
++                if (w.h_compact == nullptr || w.h_full == nullptr) {
++                    err = "EP4 owner has no pinned output buffers";
++                    return false;
++                }
++                CK(cudaMemcpyAsync(w.h_compact, w.ed, (size_t) j.nrows * D * sizeof(float), cudaMemcpyDeviceToHost, s));
++                CK(cudaStreamSynchronize(s));
++                try {
++                    ep::scatter_unweighted_rows(w.h_compact, j.scatter.src, j.nrows, D, w.h_full, kWin * kPicks,
++                                                j.T * kPicks);
++                } catch (const std::exception& e) {
++                    err = std::string("EP4 host scatter: ") + e.what();
++                    return false;
++                }
++            }
++        }
++        CK(cudaEventRecord(w.ev, s));
++        return true;
++    }
++
++    void ep_finish(EpWorker& w, bool ok, const std::string& error) {
++        {
++            std::lock_guard<std::mutex> lk(w.mu);
++            if (ok) {
++                w.recorded = w.job.seq;
++                w.at.store("event recorded", std::memory_order_release);
++            } else {
++                w.error = error.empty() ? "EP4 job failed" : error;
++                w.at.store("error", std::memory_order_release);
++            }
++            w.busy = false;
++        }
++        w.cv.notify_all();
++    }
++
++    void ep_loop(EpWorker& w) {
++        for (;;) {
++            {
++                std::unique_lock<std::mutex> lk(w.mu);
++                w.cv.wait(lk, [&] { return w.quit || w.busy; });
++                if (w.quit) return;
++            }
++            w.at.store("running", std::memory_order_release);
++            std::string error;
++            const bool ok = ep_run(w, error);
++            ep_finish(w, ok, error);
++        }
++    }
++
++    void ep_start() {
++        for (auto& wp : ep_workers) {
++            EpWorker* w = wp.get();
++            if (w->rank > 0) w->th = std::thread([this, w] { ep_loop(*w); });
++        }
++    }
++
++    bool ep_submit(EpWorker& w, const EpJob& j, std::string& err) {
++        if (w.rank == 0) {
++            w.job = j;
++            w.at_layer.store(j.layer, std::memory_order_release);
++            w.at_seq.store(j.seq, std::memory_order_release);
++            w.busy = true;
++            std::string error;
++            const bool ok = ep_run(w, error);
++            ep_finish(w, ok, error);
++            return true;
++        }
++        {
++            std::lock_guard<std::mutex> lk(w.mu);
++            if (w.busy || !w.error.empty()) {
++                err = "EP4 owner " + std::to_string(w.rank) + " cannot take a new job";
++                return false;
++            }
++            w.job = j;
++            w.at_layer.store(j.layer, std::memory_order_release);
++            w.at_seq.store(j.seq, std::memory_order_release);
++            w.at.store("queued", std::memory_order_release);
++            w.busy = true;
++        }
++        w.cv.notify_all();
++        return true;
++    }
++
++    bool ep_wait(ep::Completion& completion, const std::array<bool, 4>& has_work, unsigned seq, int layer,
++                 std::string& err) {
++        std::array<bool, 4> done = {};
++        const double deadline = now_ms() + kEpWaitMs;
++        for (;;) {
++            if ((cancel && cancel()) || halt.load(std::memory_order_acquire))
++                return ep_fail(err, "EP4 stopped at layer " + std::to_string(layer) + " seq " + std::to_string(seq));
++            bool all = true;
++            for (int rank = 0; rank < 4; ++rank) {
++                if (done[(size_t) rank]) continue;
++                EpWorker& w = *ep_workers[(size_t) rank];
++                unsigned recorded = 0;
++                std::string error;
++                {
++                    std::lock_guard<std::mutex> lk(w.mu);
++                    recorded = w.recorded;
++                    error = w.error;
++                }
++                if (!error.empty())
++                    return ep_fail(err, "EP4 rank " + std::to_string(rank) + " layer " + std::to_string(layer) +
++                                        " seq " + std::to_string(seq) + ": " + error);
++                if (recorded != seq) {
++                    all = false;
++                    if (recorded > seq)
++                        return ep_fail(err, "EP4 rank " + std::to_string(rank) + " sequence advanced past " +
++                                            std::to_string(seq));
++                    continue;
++                }
++                cudaSetDevice(devs[(size_t) rank].id);
++                const cudaError_t q = cudaEventQuery(w.ev);
++                if (q == cudaErrorNotReady) {
++                    all = false;
++                    continue;
++                }
++                if (q != cudaSuccess)
++                    return ep_fail(err, "EP4 rank " + std::to_string(rank) + " layer " + std::to_string(layer) +
++                                        " seq " + std::to_string(seq) + ": " + cudaGetErrorString(q));
++                if (rank > 0 && has_work[(size_t) rank] && w.job.nrows > 0) {
++                    if (w.h_full == nullptr) return ep_fail(err, "EP4 owner has no full pinned output buffer");
++                    // These reads precede combine on the main stream.  The next layer's route sync completes them before
++                    // this worker can clear h_full for its next job.
++                    cudaSetDevice(devs[0].id);
++                    const int D = g.dim;
++                    for (int i = 0; i < w.job.nrows; ++i) {
++                        const int row = w.job.scatter.src[i];
++                        if (row < 0 || row >= w.job.T * kPicks)
++                            return ep_fail(err, "EP4 H2D row out of range at rank " + std::to_string(rank));
++                        // Only this owner's rows are copied: a whole-buffer copy would zero the other owners' rows.
++                        const cudaError_t copy =
++                            cudaMemcpyAsync(devs[0].ed + (size_t) row * D, w.h_full + (size_t) row * D,
++                                            (size_t) D * sizeof(float), cudaMemcpyHostToDevice, devs[0].st);
++                        if (copy != cudaSuccess)
++                            return ep_fail(err, "EP4 host-to-main copy failed at rank " + std::to_string(rank) +
++                                                ": " + cudaGetErrorString(copy));
++                    }
++                }
++                done[(size_t) rank] = true;
++                w.at.store("done", std::memory_order_release);
++                if (has_work[(size_t) rank]) completion.complete_owner(rank);
++            }
++            if (all) return true;
++            if (now_ms() >= deadline) {
++                std::string pending;
++                for (int rank = 0; rank < 4; ++rank)
++                    if (!done[(size_t) rank]) pending += (pending.empty() ? "" : ",") + std::to_string(rank);
++                return ep_fail(err, "EP4 timeout at layer " + std::to_string(layer) + " seq " + std::to_string(seq) +
++                                    " waiting for rank(s) " + pending);
++            }
++            std::this_thread::sleep_for(std::chrono::microseconds(100));
++        }
++    }
++
++    bool place_ep4(std::string& err) {
++        if (L.size() != 40 || devs.size() != 4) {
++            err = "EP4 placement requires 40 layers and four devices";
++            return false;
++        }
++        for (const Layer& l : L)
++            if (l.n_cls != 1 || l.lay.fmt != gg::kFmtMXFP4 || l.nm != 1 || l.dev != 0) {
++                err = "EP4 supports only single-layout GGUF experts with every trunk layer on CUDA0";
++                return false;
++            }
++        if (!ep_open(err)) return false;
++        std::array<double, 4> room = {}, used = {};
++        for (int rank = 0; rank < 4; ++rank) {
++            Dev& d = devs[(size_t) rank];
++            CK(cudaSetDevice(d.id));
++            size_t fr = 0, tot = 0;
++            CK(mem_info(&fr, &tot));
++            room[(size_t) rank] = std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
++        }
++        std::vector<std::array<int, 4>> hot(L.size());
++        for (int rank = 0; rank < 4; ++rank) {
++            double want = 0;
++            for (const Layer& l : L) want += (double) l.blob * (l.n_exp / 4);
++            const double frac = want > 0 ? std::min(1.0, room[(size_t) rank] / want) : 0.0;
++            for (size_t il = 0; il < L.size(); ++il) {
++                Layer& l = L[il];
++                hot[il][(size_t) rank] = std::min(l.n_exp / 4, (int) std::floor(frac * (l.n_exp / 4)));
++                used[(size_t) rank] += (double) hot[il][(size_t) rank] * l.blob;
++            }
++            for (size_t il = 0; il < L.size(); ++il) {
++                Layer& l = L[il];
++                while (hot[il][(size_t) rank] < l.n_exp / 4 &&
++                       used[(size_t) rank] + l.blob <= room[(size_t) rank]) {
++                    ++hot[il][(size_t) rank];
++                    used[(size_t) rank] += l.blob;
++                }
++            }
++        }
++        for (int rank = 1; rank < 4; ++rank) {
++            int total = 0;
++            for (const auto& layer : hot) total += layer[(size_t) rank];
++            if (total == 0) {
++                err = "EP4 rank " + std::to_string(rank) + " has no VRAM for any owner-hot expert; refusing a CPU-only fallback";
++                return false;
++            }
++        }
++        for (size_t il = 0; il < L.size(); ++il) {
++            Layer& l = L[il];
++            l.slot.assign((size_t) l.n_exp, -1);
++            l.host.assign((size_t) l.n_exp, nullptr);
++            l.hh.assign((size_t) l.n_exp, {nullptr, nullptr, nullptr, nullptr});
++            l.vm.assign((size_t) l.n_exp, {});
++            l.ram.clear();
++            l.n_vram = l.n_slots = l.n_main = l.pv_n = hot[il][0];
++            l.spare_vram = -1;
++            l.rc_base = -1;
++            l.rc_n = 0;
++            l.swap_pending = false;
++            l.cpu_hits.clear();
++            l.heat.assign((size_t) l.n_exp, 0.0f);
++            const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
++            double sum = 0;
++            for (int e = 0; e < l.n_exp; ++e) sum += p[e];
++            const double scale = sum > 0 ? 512.0 / sum : 0.0;
++            for (int e = 0; e < l.n_exp; ++e) l.heat[(size_t) e] = (float) (p[e] * scale);
++            for (int rank = 1; rank < 4; ++rank) {
++                EpOwnerLayer& ol = ep_workers[(size_t) rank]->layers[il];
++                ol.slot.assign((size_t) l.n_exp, -1);
++                ol.vm.assign((size_t) (l.n_exp / 4), {});
++                ol.n_hot = hot[il][(size_t) rank];
++            }
++            for (int rank = 0; rank < 4; ++rank) {
++                std::vector<int> order((size_t) (l.n_exp / 4));
++                std::iota(order.begin(), order.end(), rank * (l.n_exp / 4));
++                std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return p[a] > p[b]; });
++                for (int i = 0; i < hot[il][(size_t) rank]; ++i) {
++                    const int e = order[(size_t) i];
++                    if (rank == 0) l.slot[(size_t) e] = i;
++                    else ep_workers[(size_t) rank]->layers[il].slot[(size_t) e] = i;
++                }
++            }
++            if (l.n_vram > 0) {
++                Dev& d = devs[0];
++                CK(cudaSetDevice(d.id));
++                void* v = nullptr;
++                if (cudaMalloc(&v, (size_t) l.n_vram * l.blob) != cudaSuccess) {
++                    err = "EP4 main-hot allocation at layer " + std::to_string(l.il) + " failed";
++                    return false;
++                }
++                d.allocs.push_back(v);
++                d.experts += (size_t) l.n_vram * l.blob;
++                l.vram_base = (uint8_t*) v;
++            }
++            for (int e = 0; e < l.n_exp; ++e)
++                if (l.slot[(size_t) e] >= 0) set_vm_view(l, e, sat(l, l, l.slot[(size_t) e], l.blob), l.vm[(size_t) e]);
++            for (int rank = 1; rank < 4; ++rank) {
++                Dev& d = devs[(size_t) rank];
++                EpOwnerLayer& ol = ep_workers[(size_t) rank]->layers[il];
++                if (ol.n_hot > 0) {
++                    CK(cudaSetDevice(d.id));
++                    void* v = nullptr;
++                    if (cudaMalloc(&v, (size_t) ol.n_hot * l.blob) != cudaSuccess) {
++                        err = "EP4 owner-hot allocation at rank " + std::to_string(rank) + " layer " +
++                              std::to_string(l.il) + " failed";
++                        return false;
++                    }
++                    d.allocs.push_back(v);
++                    d.experts += (size_t) ol.n_hot * l.blob;
++                    ol.base = (uint8_t*) v;
++                }
++                for (int e = rank * (l.n_exp / 4); e < (rank + 1) * (l.n_exp / 4); ++e)
++                    if (ol.slot[(size_t) e] >= 0)
++                        set_vm_view(l, e, ol.base + (size_t) ol.slot[(size_t) e] * l.blob,
++                                    ol.vm[(size_t) (e - rank * (l.n_exp / 4))]);
++            }
++            for (int e = 0; e < l.n_exp; ++e) {
++                bool owner_hot = false;
++                for (int rank = 1; rank < 4; ++rank)
++                    owner_hot = owner_hot || ep_workers[(size_t) rank]->layers[il].slot[(size_t) e] >= 0;
++                if (l.slot[(size_t) e] < 0 && !owner_hot) l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
++            }
++            if (!halloc(l.tab_pin, 2, err)) return false;
++            std::vector<unsigned long long> table((size_t) l.n_exp, 0ull);
++            for (int e = 0; e < l.n_exp; ++e)
++                if (l.slot[(size_t) e] >= 0) table[(size_t) e] = (unsigned long long) sat(l, l, l.slot[(size_t) e], l.blob);
++            CK(cudaSetDevice(devs[0].id));
++            CK(cudaMemcpy(l.vram_tab, table.data(), table.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice));
++        }
++        for (int rank = 0; rank < 4; ++rank) {
++            int count = 0;
++            for (size_t il = 0; il < L.size(); ++il) count += hot[il][(size_t) rank];
++            std::fprintf(stderr, "ds4: EP4 rank %d (CUDA%d): %d fixed owner-hot experts (%.2f GB), owner experts %d..%d\n",
++                         rank, devs[(size_t) rank].id, count, used[(size_t) rank] / 1e9, rank * 96, rank * 96 + 95);
++        }
++        return true;
++    }
++
++    bool load_ep4_owners(std::string& err) {
++        struct Job { int rank, layer, expert; };
++        std::vector<Job> jobs;
++        size_t maxb = 0;
++        for (const Layer& l : L) maxb = std::max(maxb, l.blob);
++        for (int rank = 1; rank < 4; ++rank)
++            for (const Layer& l : L)
++                for (int e = rank * (l.n_exp / 4); e < (rank + 1) * (l.n_exp / 4); ++e)
++                    if (ep_workers[(size_t) rank]->layers[(size_t) l.il].slot[(size_t) e] >= 0)
++                        jobs.push_back({rank, l.il, e});
++        std::atomic<size_t> next{0};
++        std::atomic<bool> failed{false};
++        std::mutex mu;
++        std::string why;
++        std::vector<std::thread> threads;
++        for (int t = 0; t < 12 && !jobs.empty(); ++t)
++            threads.emplace_back([&] {
++                uint8_t* stage = nullptr;
++                cudaHostAlloc((void**) &stage, maxb, cudaHostAllocPortable);
++                for (;;) {
++                    const size_t i = next.fetch_add(1);
++                    if (i >= jobs.size() || failed.load()) break;
++                    const Job& j = jobs[i];
++                    const Layer& l = L[(size_t) j.layer];
++                    const EpOwnerLayer& ol = ep_workers[(size_t) j.rank]->layers[(size_t) j.layer];
++                    bool ok = stage != nullptr && read_mx_file(l, j.expert, stage) &&
++                              cudaSetDevice(devs[(size_t) j.rank].id) == cudaSuccess &&
++                              cudaMemcpy(ol.base + (size_t) ol.slot[(size_t) j.expert] * l.blob, stage, l.blob,
++                                         cudaMemcpyHostToDevice) == cudaSuccess;
++                    if (!ok) {
++                        std::lock_guard<std::mutex> lk(mu);
++                        failed.store(true);
++                        why = "EP4 upload rank " + std::to_string(j.rank) + " layer " + std::to_string(j.layer) +
++                              " expert " + std::to_string(j.expert) + " failed";
++                        break;
++                    }
++                }
++                if (stage != nullptr) cudaFreeHost(stage);
++            });
++        for (auto& t : threads) t.join();
++        if (failed.load()) {
++            err = why;
++            return false;
++        }
++        ep_start();
++        return true;
++    }
++
++    bool ep_moe(Layer& l, Dev& d, int T, bool hs, bool fuse, std::string& err) {
++        if (!ep_broken.empty()) {
++            err = ep_broken;
++            return false;
++        }
++        const int D = g.dim;
++        cudaStream_t s = d.st;
++        ep::Layout layout(l.n_exp, 4);
++        ep::Plan plan;
++        try {
++            plan = ep::plan_window(
++                T, l.k_exp, h_idx, h_w, layout, [&](int e) { return layout.owner(e) == 0 && l.slot[(size_t) e] >= 0; },
++                [&](int owner, int e) {
++                    return owner == 0 ? l.slot[(size_t) e] >= 0
++                                      : ep_workers[(size_t) owner]->layers[(size_t) l.il].slot[(size_t) e] >= 0;
++                });
++        } catch (const std::exception& e) {
++            return ep_fail(err, std::string("EP4 routing: ") + e.what());
++        }
++        ep::Completion completion(plan, 4);
++        std::array<EpJob, 4> jobs;
++        std::array<bool, 4> has_work = {};
++        const unsigned seq = ++ep_seq;
++        for (int rank = 0; rank < 4; ++rank) {
++            jobs[(size_t) rank].rank = rank;
++            jobs[(size_t) rank].layer = l.il;
++            jobs[(size_t) rank].T = T;
++            jobs[(size_t) rank].seq = seq;
++        }
++        Combine cm = {};
++        uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
++        for (const ep::Pick& pick : plan.picks) {
++            const int e = pick.expert;
++            ++pr[e];
++            l.heat[(size_t) e] += 1.0f;
++            if (pick.tier == ep::Tier::cpu_cold) {
++                cm.cpu[pick.token] = 1;
++                l.cpu_hits.push_back(e);
++                continue;
++            }
++            const int row = ep::output_row(pick, kPicks);
++            cm.row[pick.token][cm.n[pick.token]] = row;
++            cm.w[pick.token][cm.n[pick.token]] = pick.weight;
++            ++cm.n[pick.token];
++        }
++        for (const ep::Group& group : plan.groups) {
++            EpJob& j = jobs[(size_t) group.owner];
++            has_work[(size_t) group.owner] = true;
++            const int gi = j.nvex++;
++            j.vex[gi] = group.expert;
++            j.vrow0[gi] = j.nrows;
++            j.vn[gi] = (int) group.picks.size();
++            for (const size_t index : group.picks) {
++                const ep::Pick& pick = plan.picks[index];
++                j.gather.src[j.nrows] = pick.token;
++                j.scatter.src[j.nrows] = ep::output_row(pick, kPicks);
++                ++j.nrows;
++            }
++        }
++        std::vector<std::vector<size_t>> cold((size_t) l.n_exp);
++        for (const size_t index : plan.cpu_picks) cold[(size_t) plan.picks[index].expert].push_back(index);
++        std::vector<Ent> ents;
++        std::vector<std::pair<int, float>> cpu_rows;
++        int nslots = 0;
++        for (int e = 0; e < l.n_exp; ++e) {
++            const auto& rows = cold[(size_t) e];
++            for (size_t a = 0; a < rows.size(); a += kc::kExl3CpuMaxN) {
++                Ent en;
++                en.e = e;
++                en.slot0 = nslots;
++                en.n = (int) std::min<size_t>(kc::kExl3CpuMaxN, rows.size() - a);
++                for (int i = 0; i < en.n; ++i) {
++                    const ep::Pick& pick = plan.picks[rows[a + (size_t) i]];
++                    en.tok[i] = pick.token;
++                    cpu_rows.push_back({pick.token, pick.weight});
++                }
++                nslots += en.n;
++                ents.push_back(en);
++            }
++        }
++        st.experts += (int64_t) T * l.k_exp;
++        st.cpu_experts += nslots;
++        for (int rank = 1; rank < 4; ++rank)
++            if (!ep_submit(*ep_workers[(size_t) rank], jobs[(size_t) rank], err))
++                return ep_fail(err, "EP4 submit rank " + std::to_string(rank) + " layer " + std::to_string(l.il) +
++                                    " seq " + std::to_string(seq) + ": " + err);
++        if (!ep_submit(*ep_workers[0], jobs[0], err))
++            return ep_fail(err, "EP4 submit rank 0 layer " + std::to_string(l.il) + ": " + err);
++        if (!ents.empty()) {
++            const double tc = now_ms();
++            cpu_experts(l, h_x, ents);
++            std::fill(h_part, h_part + (size_t) T * D, 0.0f);
++            for (int slot = 0; slot < nslots; ++slot) {
++                float* out = h_part + (size_t) cpu_rows[(size_t) slot].first * D;
++                const float weight = cpu_rows[(size_t) slot].second;
++                const float* y = c_yd.data() + (size_t) slot * D;
++                for (int e = 0; e < D; ++e) out[e] += weight * y[e];
++            }
++            st.cpu_ms += now_ms() - tc;
++            const cudaError_t copy =
++                cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * sizeof(float), cudaMemcpyHostToDevice, s);
++            if (copy != cudaSuccess)
++                return ep_fail(err, "EP4 CPU-part copy failed: " + std::string(cudaGetErrorString(copy)));
++        }
++        completion.complete_cpu();
++        main_at.store("waiting for EP4 owner events", std::memory_order_relaxed);
++        if (!ep_wait(completion, has_work, seq, l.il, err)) return false;
++        main_at.store("EP4 owner events complete", std::memory_order_relaxed);
++        if (!completion.can_combine()) return ep_fail(err, "EP4 incomplete result refused at combine");
++        const cudaError_t main_dev = cudaSetDevice(d.id);
++        if (main_dev != cudaSuccess)
++            return ep_fail(err, "EP4 cannot restore the main device for combine: " +
++                                std::string(cudaGetErrorString(main_dev)));
++        (void) cudaGetLastError();   // event-polling's NotReady is not a combine launch error
++        combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
++        const cudaError_t launched = cudaGetLastError();
++        if (launched != cudaSuccess)
++            return ep_fail(err, "EP4 combine launch failed: " + std::string(cudaGetErrorString(launched)));
++        if (hs) {
++            const cudaError_t wait = cudaStreamWaitEvent(s, d.hc_done, 0);
++            if (wait != cudaSuccess)
++                return ep_fail(err, "EP4 HC wait failed: " + std::string(cudaGetErrorString(wait)));
++        }
++        ablate(d, d.moe_out, T, s);
++        hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, g.hc, T, d.h2, s);
++        const cudaError_t post = cudaGetLastError();
++        if (post != cudaSuccess)
++            return ep_fail(err, "EP4 HC post failed: " + std::string(cudaGetErrorString(post)));
++        std::swap(d.h, d.h2);
++        if (!fuse) {
++            const cudaError_t pre = cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s);
++            if (pre != cudaSuccess)
++                return ep_fail(err, "EP4 pre copy failed: " + std::string(cudaGetErrorString(pre)));
+         }
+         return true;
+     }
+@@ -6484,6 +7180,7 @@
+             double sum = 0;
+             for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+             for (int e = 0; e < l.n_exp; ++e) {
++                if (ep4() && l.slot[(size_t) e] < 0 && l.host[(size_t) e] == nullptr) continue;   // owner-hot, not CPU-cold
+                 if (l.slot[(size_t) e] >= 0 || helper_owned(l, e)) {   // (the helper's: in its pool)
+                     for (int r = 0; r < 3; ++r)
+                         os::advise(pk.fds[(size_t) l.mx_file[r]], (l.mx_off[r] + (uint64_t) e * l.mx_stride[r]), mx_part_bytes(l, r), false);
+@@ -7214,6 +7911,20 @@
+         if (!abl_what.empty()) s << abl_what << "\n";
+         for (size_t di = 0; di < devs.size(); ++di) {
+             const Dev& d = devs[di];
++            if (ep4() && di > 0) {
++                int ev = 0;
++                for (const EpOwnerLayer& ol : ep_workers[di]->layers) ev += ol.n_hot;
++                size_t fr = 0, tot = 0;
++                cudaSetDevice(d.id);
++                mem_info(&fr, &tot);
++                char line[384];
++                std::snprintf(line, sizeof line,
++                              "ds4: EP4 CUDA%d owner experts [%d, %d]: weights 0.00 GB, experts %.2f GB (%d of %d "
++                              "owner-hot), caches 0.00 GB, %.0f MiB free\n",
++                              d.id, (int) di * 96, (int) di * 96 + 95, d.experts / 1e9, ev, g.nl * 96, fr / 1048576.0);
++                s << line;
++                continue;
++            }
+             int a = -1, b = -1, ev = 0, et = 0;
+             for (const Layer& l : L)
+                 for (int m = 0; m < l.nm; ++m)
+@@ -7221,7 +7932,7 @@
+                         if (a < 0) a = l.il;
+                         b = l.il;
+                         ev += l.n_vram;
+-                        et += l.n_exp;
++                        et += ep4() ? l.n_exp / 4 : l.n_exp;
+                     }
+             size_t fr = 0, tot = 0;
+             cudaSetDevice(d.id);
+@@ -7248,8 +7959,13 @@
+         int nh = 0;
+         size_t hb_ = 0;
+         for (const Layer& l : L) {
+-            nh += l.n_exp - l.n_vram;
+-            hb_ += (size_t) (l.n_exp - l.n_vram) * l.blob;
++            int cold = l.n_exp - l.n_vram;
++            if (ep4()) {
++                cold = 0;
++                for (const uint8_t* host : l.host) cold += host != nullptr;
++            }
++            nh += cold;
++            hb_ += (size_t) cold * l.blob;
+         }
+         char line[200];
+         if (copy_mode)
+@@ -13623,13 +14339,16 @@
+         }
+         return true;
+     }
+-    bool mv_n(Dev& d, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr) {
++    bool mv_n(Dev&, cudaStream_t s, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr) {
+         for (int a = 0; a < n; a += x3::kMaxMvJobs)
+-            if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), d.st, pre)) {
++            if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), s, pre)) {
+                 err = "exl3 mv failed";
+                 return false;
+             }
+         return true;
++    }
++    bool mv_n(Dev& d, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr) {
++        return mv_n(d, d.st, j, n, err, pre);
+     }
+     // y[c] = x[c] W for the T activations x + c * x_cs (floats), into y + c * y_cs
+     static x3::MvJob job(const x3::Mat& m, const float* x, float* y, int T = 1, size_t x_cs = 0, size_t y_cs = 0,
+@@ -16541,6 +17260,10 @@
+     }
+ 
+     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
++        if (!ep_broken.empty()) {
++            err = ep_broken;
++            return false;
++        }
+         if (lend_broken) {
+             err = kLendBroken;
+             return false;
+@@ -17270,6 +17993,10 @@
+             hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+         }
+         const gg::PreQ8* ffn_q8 = fuse && hc_fuse_win ? &xq8 : nullptr;   // (the shared expert's w1 / w3 input)
++        if (ep4() && wp.async) {
++            err = "EP4 requires the synchronous window path (DS4_SYNC=1, no chunks or device threads)";
++            return false;
++        }
+         if (wp.async) {
+             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
+             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
+@@ -17460,6 +18187,7 @@
+         const double tw = now_ms();
+         CK(cudaEventSynchronize(d.ev));
+         st.gpu_wait_ms += now_ms() - tw;
++        if (ep4()) return ep_moe(l, d, T, hs, fuse, err);
+         // the picks by expert: the VRAM ones' rows (gathered inputs, one GEMV per matrix for all their tokens), the
+         // CPU lane's entries
+         Combine cm;
+@@ -17755,7 +18483,11 @@
+     std::vector<std::string> info_lines() const {
+         std::vector<std::string> v;
+         int nh = 0;
+-        for (const Layer& l : L) nh += l.n_exp - l.n_vram;
++        for (const Layer& l : L) {
++            if (ep4()) {
++                for (const uint8_t* host : l.host) nh += host != nullptr;
++            } else nh += l.n_exp - l.n_vram;
++        }
+         char b[512];
+         // kv=fp4: DeepSeek's own cache layout (the compressed KV and the index keys FP4, the window FP8)
+         std::snprintf(b, sizeof b, "INFO context=%lld kv=fp4 kv_resident=%lld expert_slots=%d engine_kind=ds4 "
+@@ -17790,6 +18522,8 @@
+                     z = l.il;
+                     slots += l.n_slots;
+                 }
++            if (ep4() && &d != &devs[0])
++                for (const EpOwnerLayer& ol : ep_workers[(size_t) (&d - devs.data())]->layers) slots += ol.n_hot;
+             mtp_dense = std::min(mtp_dense, d.weights);
+             mtp_exp = std::min(mtp_exp, d.experts);
+             const size_t tn = groups[(size_t) d.grp].mem.size();
+@@ -17962,10 +18696,16 @@
+     double cb = 0;
+     for (const Layer& l : m.L) {
+         if (l.mtp) continue;
+-        t.vram += l.n_vram;
+-        t.vram_gb += (double) l.n_vram * (double) l.blob / 1e9;
+-        t.cpu += l.n_exp - l.n_vram;
+-        cb += (double) (l.n_exp - l.n_vram) * (double) l.blob;
++        int cold = l.n_exp - l.n_vram;
++        if (m.ep4()) {
++            cold = 0;
++            for (const uint8_t* host : l.host) cold += host != nullptr;
++        }
++        const int vram = l.n_exp - cold;
++        t.vram += vram;
++        t.vram_gb += (double) vram * (double) l.blob / 1e9;
++        t.cpu += cold;
++        cb += (double) cold * (double) l.blob;
+     }
+     t.cpu_blob = t.cpu > 0 ? cb / t.cpu : 0;
+     // in RAM: the copies (copy_experts / the RAM tier); in place, the read-ahead's share of the page cache; not in
+--- a/src/ds4/ds4_model.hpp
++++ b/src/ds4/ds4_model.hpp
+@@ -1,5 +1,6 @@
+-// src/ds4/ds4_model.hpp - DeepSeek-V4.1-Flash on Maya: an EXL3 model (tools/ds4/pack.py's pack beside its files) over
+-// the machine's GPUs, layer-split, with the routed experts that do not fit in VRAM on the CPU lane.
++// src/ds4/ds4_model.hpp - DeepSeek-V4.1-Flash on Maya: an EXL3/GGUF model over the machine's GPUs.  The default is
++// layer-split; the restricted EP4 mode keeps the trunk on GPU 0 and gives each of four owners 96 routed experts.  Routed
++// experts outside VRAM run on one shared CPU lane (main-hot, owner-hot and CPU-cold are distinct states).
+ //
+ // Windows of up to 16 tokens through every layer (a prompt in windows, a decode step a window of one): each query of a
+ // window sees exactly what the reference's decode path gives it (DeepSeek's inference/model.py at start_pos > 0) -
+@@ -30,7 +31,7 @@
+     // NUMA node's cores when measured faster at load; n: at most n, a thread a core
+     int cpu_threads = 0;
+     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
+-    bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
++    bool expert_cache = true;         // layer-split: experts move with use; EP4: accepted but its hot sets stay fixed
+     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
+     // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them
+     int mmap_experts = -1;
+@@ -41,8 +42,11 @@
+     bool lookup = false;
+     // tensor parallelism: runs of tp GPUs of one kind (the same memory) take the same layers, each a share of the
+     // heads, of the output projection and of every expert's FFN, summed through host-mapped memory (a GPU unlike the
+-    // next stays alone); tp > 1 runs with threads (--tp 1 --threads off: one host thread, layer split only)
++    // next stays alone); tp > 1 runs with threads (--ep 1 --tp 1 --threads off: one host thread, layer split only)
+     int tp = 2;
++    // expert parallelism: 1 keeps the layer-split path; 4 is the restricted GGUF EP4 path (four expert owners, all
++    // dense weights and the only conversation on GPU 0).  It is not a layer split and never enables tensor parallelism.
++    int ep = 1;
+     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
+     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
+     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
+--- a/src/ds4/ds4_main.cpp
++++ b/src/ds4/ds4_main.cpp
+@@ -96,7 +96,8 @@
+     std::fprintf(stderr,
+                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
+                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
+-                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
++                 "           [--tp N] [--ep 1|4] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none]\n"
++                 "           [--dspark-conf F]\n"
+                  "           [--suffix-draft N]\n"
+                  "           [--vision on|off] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
+                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
+@@ -1862,6 +1863,8 @@
+     float temp = 0.0f;   // the CLI's sampling (0: greedy)
+     unsigned long long cli_seed = 1;
+     bool serve_mode = false, multi_check = false;
++    bool tp_given = false, prefill_given = false;
++    std::string tp_arg, prefill_arg;
+     std::string images, enc_rgb, enc_out;
+     int enc_w = 0, enc_h = 0;
+     for (int i = 1; i < argc; ++i) {
+@@ -1902,8 +1905,24 @@
+             o.dspark = v != "none";   // none: not even loaded
+         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
+         else if (a == "--suffix-draft") suffix_draft = std::max(0, std::atoi(val("--suffix-draft").c_str()));
+-        else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
+-        else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
++        else if (a == "--tp") {
++            tp_given = true;
++            tp_arg = val("--tp");
++            o.tp = std::max(1, std::atoi(tp_arg.c_str()));
++        }
++        else if (a == "--ep") {
++            const std::string v = val("--ep");
++            if (v != "1" && v != "4") {
++                std::fprintf(stderr, "--ep takes 1 (layer split) or 4 (expert parallel)\n");
++                return 2;
++            }
++            o.ep = std::atoi(v.c_str());
++        }
++        else if (a == "--prefill-chunk") {
++            prefill_given = true;
++            prefill_arg = val("--prefill-chunk");
++            o.prefill_chunk = std::max(0, std::atoi(prefill_arg.c_str()));
++        }
+         else if (a == "--threads") o.threads = val("--threads") != "off";
+         else if (a == "--vision") o.vision = val("--vision") != "off";
+         else if (a == "--mmap-experts") {
+@@ -1944,6 +1963,21 @@
+     if (multi_check && (o.seqs < 2 || ids_s.empty())) {
+         std::fprintf(stderr, "--multi-check needs --parallel 2..8 and --ids\n");
+         return 2;
++    }
++    if (o.ep == 4) {
++        auto whole = [](const std::string& v, long lo) {
++            char* end = nullptr;
++            const double d = std::strtod(v.c_str(), &end);
++            return !v.empty() && end != v.c_str() && *end == '\0' && d >= lo && d <= 1048576.0 && std::trunc(d) == d;
++        };
++        if ((tp_given && !whole(tp_arg, 1)) || (prefill_given && !whole(prefill_arg, 0))) {
++            std::fprintf(stderr, "--ep 4 requires exactly --tp 1 and --prefill-chunk 0\n");
++            return 2;
++        }
++        if (!images.empty()) {
++            std::fprintf(stderr, "--ep 4 with --vision off does not accept --images\n");
++            return 2;
++        }
+     }
+     if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty())) {
+         usage();
+--- a/src/ds4/ds4_kernels.cu
++++ b/src/ds4/ds4_kernels.cu
+@@ -2532,6 +2532,14 @@
+     const int r = blockIdx.y;
+     const int c = blockIdx.x * blockDim.x + threadIdx.x;
+     if (c < cols) out[(size_t) r * cols + c] = x[(size_t) g.src[r] * cols + c];
++}
++
++__global__ void scatter_kernel(const float* __restrict__ x, Gather g, int cols, float* __restrict__ out) {
++    pdl_wait();
++    pdl_trigger();
++    const int r = blockIdx.y;
++    const int c = blockIdx.x * blockDim.x + threadIdx.x;
++    if (c < cols) out[(size_t) g.src[r] * cols + c] = x[(size_t) r * cols + c];
+ }
+ 
+ // bytes [col0, col0 + width) of each row of a matrix `pitch` bytes a row, side by side into out (`width` bytes a row) -
+@@ -4087,6 +4095,9 @@
+ 
+ void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s) {
+     if (n > 0) pdl_launch(gather_kernel, dim3(cdiv(cols, kThreads), n), kThreads, 0, s, x, g, cols, out);
++}
++void scatter_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s) {
++    if (n > 0) pdl_launch(scatter_kernel, dim3(cdiv(cols, kThreads), n), kThreads, 0, s, x, g, cols, out);
+ }
+ void gather_cols(const uint8_t* src, size_t pitch, size_t col0, size_t width, int rows, uint8_t* out, cudaStream_t s) {
+     if (rows <= 0 || width == 0) return;
+--- a/src/ds4/ds4_kernels.cuh
++++ b/src/ds4/ds4_kernels.cuh
+@@ -276,6 +276,8 @@
+     int src[kWin * kPicks];
+ };
+ void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s);
++/// out[src[r]] = x[r] for r < n (the destination rows of an EP owner's unweighted expert outputs).
++void scatter_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s);
+ // bytes [col0, col0 + width) of each of `rows` rows of a matrix `pitch` bytes a row, side by side into out
+ void gather_cols(const uint8_t* src, size_t pitch, size_t col0, size_t width, int rows, uint8_t* out, cudaStream_t s);
+ /// The MoE's sum, token t: out[t] = sum_j w[t][j] ed[row[t][j]] (its VRAM experts, in pick order) + cpu[t] (when its

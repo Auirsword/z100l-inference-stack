@@ -1,0 +1,95 @@
+--- a/src/ds4/ds4_main.cpp
++++ b/src/ds4/ds4_main.cpp
+@@ -270,7 +270,8 @@
+ // tok.
+ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
+            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
+-           int& accepted, std::string& err, float cum_min = -1.0f, Lookup* lk = nullptr) {
++           int& accepted, std::string& err, float cum_min = -1.0f, Lookup* lk = nullptr,
++           size_t* final_logits_row = nullptr) {
+     out.clear();
+     offered = accepted = 0;
+     const double t0 = now_ms();
+@@ -308,6 +309,7 @@
+             out.push_back(next);
+             offered = keep;
+             accepted = acc;
++            if (final_logits_row != nullptr) *final_logits_row = (size_t) acc;
+             if (lk != nullptr) {
+                 lk->policy.observe(from_lk, keep + 1, acc, match, now_ms() - t0);
+                 if (from_lk) {
+@@ -336,6 +338,7 @@
+             out.push_back(next);
+             offered = (int) drafts.size();
+             accepted = acc;
++            if (final_logits_row != nullptr) *final_logits_row = (size_t) acc;
+             lk->policy.observe(true, pk.t, acc, match, now_ms() - t0);
+             ++lk->windows;
+             lk->offered += offered;
+@@ -344,6 +347,7 @@
+         }
+     }
+     if (!m.step(tok, true, err)) return false;
++    if (final_logits_row != nullptr) *final_logits_row = 0;
+     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
+     if (lk != nullptr) lk->policy.observe(false, 1, 0, match, now_ms() - t0);
+     return true;
+@@ -2121,6 +2125,7 @@
+     const std::string dpath = reps > 1 ? dump + "." + std::to_string(rep) : dump;
+     std::FILE* df = dump.empty() ? nullptr : std::fopen(dpath.c_str(), "wb");
+     std::vector<float> lg;
++    size_t prompt_rows = 0;
+     m.begin_request();
+     // DS4_PROFILE_PROMPT: the prompt alone in the capture (nsys --capture-range=cudaProfilerApi), the last pass
+     const bool prof_prompt = std::getenv("DS4_PROFILE_PROMPT") != nullptr && rep == reps - 1;
+@@ -2134,9 +2139,20 @@
+             std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+             return 1;
+         }
+-        if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
++        if (df != nullptr) {
++            if (!m.logits(lg) || lg.size() != (size_t) T * (size_t) m.vocab()) {
++                std::fprintf(stderr, "maya-ds4: prompt logits row mismatch\n");
++                return 1;
++            }
++            prompt_rows = lg.size() / (size_t) m.vocab();
++            if (std::fwrite(lg.data(), 4, lg.size(), df) != lg.size()) {
++                std::fprintf(stderr, "maya-ds4: could not write prompt logits\n");
++                return 1;
++            }
++        }
+         a += (size_t) T;
+     }
++    size_t final_logits_row = prompt_rows > 0 ? prompt_rows - 1 : 0;
+     m.set_images({});
+     const double t1 = now_ms();
+     if (prof_prompt) cudaProfilerStop();
+@@ -2179,7 +2195,7 @@
+                 int off = 0, acc = 0;
+                 const bool try_spec = spec && !cool;
+                 if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
+-                           cli_seed, counter, got, off, acc, err, -1.0f, lk.get())) {
++                           cli_seed, counter, got, off, acc, err, -1.0f, lk.get(), &final_logits_row)) {
+                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+                     return 1;
+                 }
+@@ -2193,7 +2209,18 @@
+             got.pop_back();
+         }
+         std::printf("\n");
+-        if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
++        if (df != nullptr) {
++            const size_t V = (size_t) m.vocab();
++            if (!m.logits(lg) || lg.empty() || lg.size() % V != 0 || final_logits_row >= lg.size() / V) {
++                std::fprintf(stderr, "maya-ds4: invalid final logits row selection\n");
++                return 1;
++            }
++            std::fprintf(stderr, "ds4: dump final decode row %zu of %zu\n", final_logits_row, lg.size() / V);
++            if (std::fwrite(lg.data() + final_logits_row * V, 4, V, df) != V) {
++                std::fprintf(stderr, "maya-ds4: could not write final decode logits\n");
++                return 1;
++            }
++        }
+         if (lk && lk->windows > lk_w0)
+             std::fprintf(stderr, "prompt lookup: %lld rounds, %lld of its %lld drafts kept (in the dspark line's)\n",
+                          lk->windows - lk_w0, lk->accepted - lk_a0, lk->offered - lk_o0);

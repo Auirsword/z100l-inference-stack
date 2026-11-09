@@ -1,0 +1,236 @@
+diff -ruN base/CMakeLists.txt work/CMakeLists.txt
+--- base/CMakeLists.txt	2026-11-04 01:26:33.094731100 +0800
++++ work/CMakeLists.txt	2026-11-04 01:31:46.607872200 +0800
+@@ -176,6 +176,8 @@
+ if(STRATA_BUILD_TESTS)
+   add_executable(ds4_native_canonical_test tests/ds4_native_canonical_test.cpp)
+   add_test(NAME ds4_native_canonical_test COMMAND ds4_native_canonical_test)
++  add_executable(ds4_native_ordered_test tests/ds4_native_ordered_test.cpp)
++  add_test(NAME ds4_native_ordered_test COMMAND ds4_native_ordered_test)
+   add_executable(ds4_prefill_stats_test tests/ds4_prefill_stats_test.cpp)
+   add_test(NAME ds4_prefill_stats_test COMMAND ds4_prefill_stats_test)
+   add_executable(ds4_pcie_test tests/ds4_pcie_test.cpp)
+diff -ruN base/src/ds4/ds4_deterministic_math.hpp work/src/ds4/ds4_deterministic_math.hpp
+--- base/src/ds4/ds4_deterministic_math.hpp	2026-11-04 01:26:33.173606500 +0800
++++ work/src/ds4/ds4_deterministic_math.hpp	2026-11-04 01:27:05.381095800 +0800
+@@ -22,6 +22,16 @@
+ 
+ }  // namespace strata::ds4::gguf::native_canonical
+ 
++namespace strata::ds4::gguf::native_ordered {
++
++/// 0: unset or off, 1: on, -1: invalid (model loading must reject it).
++inline int parse(const char* value) {
++    if (value == nullptr || std::strcmp(value, "0") == 0) return 0;
++    return std::strcmp(value, "1") == 0 ? 1 : -1;
++}
++
++}  // namespace strata::ds4::gguf::native_ordered
++
+ namespace strata::ds4::gguf::deterministic {
+ 
+ inline bool enabled() {
+@@ -34,6 +44,11 @@
+ }
+ inline bool canonical_math() { return canonical_math(enabled(), std::getenv("DS4_NATIVE_CANONICAL")); }
+ 
++inline bool ordered_merge(bool deterministic_enabled, const char* native_value) {
++    return deterministic_enabled || native_ordered::parse(native_value) == 1;
++}
++inline bool ordered_merge() { return ordered_merge(enabled(), std::getenv("DS4_NATIVE_ORDERED_COMBINE")); }
++
+ inline bool supported_type(int type) { return type == 16 || type == 18 || type == 21 || type == 22; }
+ 
+ DS4_DET_HD inline double add(double a, double b) {
+diff -ruN base/src/ds4/ds4_model.cu work/src/ds4/ds4_model.cu
+--- base/src/ds4/ds4_model.cu	2026-11-04 01:26:33.232163900 +0800
++++ work/src/ds4/ds4_model.cu	2026-11-04 01:30:42.357344500 +0800
+@@ -2916,6 +2916,12 @@
+             err = std::string("DS4_NATIVE_CANONICAL=") + native_value + ": expected 0 or 1";
+             return false;
+         }
++        const char* ordered_value = std::getenv("DS4_NATIVE_ORDERED_COMBINE");
++        const int ordered_mode = gg::native_ordered::parse(ordered_value);
++        if (ordered_mode < 0) {
++            err = std::string("DS4_NATIVE_ORDERED_COMBINE=") + ordered_value + ": expected 0 or 1";
++            return false;
++        }
+         const double t0 = now_ms();
+         if (o.ep != 1 && o.ep != 4) {
+             err = "expert parallel takes --ep 1 or --ep 4";
+@@ -3247,8 +3253,13 @@
+         }
+         if (native_mode == 1)
+             std::fprintf(stderr, "ds4: DS4_NATIVE_CANONICAL=1 diagnostic candidate: canonical Q8_K routed-expert "
+-                                 "token/window/grouped-mv dots and shared scalar SwiGLU on GPU and CPU cold lane; "
+-                                 "native scheduling, streaming and merge unchanged\n");
++                                 "token/window/grouped-mv dots and shared scalar SwiGLU on GPU and CPU cold lane; %s",
++                         ordered_mode == 1 ? "native scheduling and streaming unchanged; ordered merge selected separately\n"
++                                           : "native scheduling, streaming and merge unchanged\n");
++        if (ordered_mode == 1)
++            std::fprintf(stderr, "ds4: DS4_NATIVE_ORDERED_COMBINE=1 diagnostic candidate: unweighted (token,pick) rows and "
++                                 "fixed-pick merge on synchronous host-routed PP/G2 and EP4; native asynchronous direct "
++                                 "combine is rejected; DS4_DETERMINISTIC and canonical math are not implied\n");
+         one_gpu_path();   // (the devices, their groups and the helper GPU known: before the recent slots' count)
+         // (a GGUF: 32 too while streamed experts land in them, DS4_LAND - the link's bytes stay in VRAM)
+         recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && (!file_experts || (pk.gguf && ln_land)) ? 32.0f : 0.0f));
+@@ -3583,7 +3594,7 @@
+                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
+                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
+                       dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err);
+-            if (ok && gg::deterministic::enabled() && !ep4()) ok = dalloc(d, d.det_out, P * D, err);
++            if (ok && gg::deterministic::ordered_merge() && !ep4()) ok = dalloc(d, d.det_out, P * D, err);
+             if (!ok) return false;
+             CK(cudaMemset(d.cpu_any, 0, sizeof(int)));
+             d.attn_scr.max_t = kAttnScratchT;
+@@ -6471,18 +6482,18 @@
+             ++pr[e];
+             l.heat[(size_t) e] += 1.0f;
+             if (pick.tier == ep::Tier::cpu_cold) {
+-                if (!gg::deterministic::enabled()) cm.cpu[pick.token] = 1;
++                if (!gg::deterministic::ordered_merge()) cm.cpu[pick.token] = 1;
+                 l.cpu_hits.push_back(e);
+                 continue;
+             }
+-            if (!gg::deterministic::enabled()) {
++            if (!gg::deterministic::ordered_merge()) {
+                 const int row = ep::output_row(pick, kPicks);
+                 cm.row[pick.token][cm.n[pick.token]] = row;
+                 cm.w[pick.token][cm.n[pick.token]] = pick.weight;
+                 ++cm.n[pick.token];
+             }
+         }
+-        if (gg::deterministic::enabled())
++        if (gg::deterministic::ordered_merge())
+             for (int t = 0; t < T; ++t) {
+                 cm.n[t] = l.k_exp;
+                 for (int i = 0; i < l.k_exp; ++i) {
+@@ -6519,7 +6530,8 @@
+                 for (int i = 0; i < en.n; ++i) {
+                     const ep::Pick& pick = plan.picks[rows[a + (size_t) i]];
+                     en.tok[i] = pick.token;
+-                    cpu_rows.push_back({gg::deterministic::enabled() ? ep::output_row(pick, kPicks) : pick.token, pick.weight});
++                    cpu_rows.push_back({gg::deterministic::ordered_merge() ? ep::output_row(pick, kPicks) : pick.token,
++                                        pick.weight});
+                 }
+                 nslots += en.n;
+                 ents.push_back(en);
+@@ -6539,7 +6551,7 @@
+         if (!ents.empty()) {
+             const double tc = now_ms();
+             cpu_experts(l, h_x, ents);
+-            if (gg::deterministic::enabled()) {
++            if (gg::deterministic::ordered_merge()) {
+                 for (int slot = 0; slot < nslots; ++slot)
+                     CK(cudaMemcpyAsync(d.ed + (size_t) cpu_rows[(size_t) slot].first * D,
+                                        c_yd.data() + (size_t) slot * D, (size_t) D * sizeof(float),
+@@ -6573,7 +6585,7 @@
+             return ep_fail(err, "EP4 cannot restore the main device for combine: " +
+                                 std::string(cudaGetErrorString(main_dev)));
+         (void) cudaGetLastError();   // event-polling's NotReady is not a combine launch error
+-        combine(d.ed, !gg::deterministic::enabled() && !ents.empty() ? d.cpu_part : nullptr, d.sh_out, cm, T, D,
++        combine(d.ed, !gg::deterministic::ordered_merge() && !ents.empty() ? d.cpu_part : nullptr, d.sh_out, cm, T, D,
+                 d.moe_out, s);
+         if (gg::deterministic::enabled()) prof_mark(d, 10);
+         const cudaError_t launched = cudaGetLastError();
+@@ -18342,6 +18354,12 @@
+             return false;
+         }
+         if (wp.async) {
++            if (!gg::deterministic::enabled() &&
++                gg::native_ordered::parse(std::getenv("DS4_NATIVE_ORDERED_COMBINE")) == 1) {
++                err = "DS4_NATIVE_ORDERED_COMBINE=1 does not cover native asynchronous direct combine "
++                      "(mx_combine_kernel with pre-aggregated Resp::part); use synchronous host-routed windows or EP4";
++                return false;
++            }
+             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
+             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
+             // router made), and waits for the answer only before the experts' sum
+@@ -18559,7 +18577,7 @@
+         int vex[kWin * kPicks], vrow0[kWin * kPicks], vn[kWin * kPicks];
+         int nvex = 0, nrows = 0;
+         std::vector<Ent> ents;
+-        std::vector<std::pair<int, float>> cpu_rows;   // slot -> (token, or global row in deterministic mode; weight)
++        std::vector<std::pair<int, float>> cpu_rows;   // slot -> (token, or global row for ordered merge; weight)
+         std::vector<std::vector<std::pair<int, int>>> per((size_t) l.n_exp);   // expert -> (token, pick)
+         for (int t = 0; t < T; ++t) {
+             cm.n[t] = 0;
+@@ -18587,7 +18605,7 @@
+                 for (const auto& tp : pe) {
+                     const int t = tp.first;
+                     ga.src[nrows] = t;
+-                    if (gg::deterministic::enabled()) ordered.src[nrows] = t * kPicks + tp.second;
++                    if (gg::deterministic::ordered_merge()) ordered.src[nrows] = t * kPicks + tp.second;
+                     else {
+                         cm.row[t][cm.n[t]] = nrows;
+                         cm.w[t][cm.n[t]] = h_w[t * kPicks + tp.second];
+@@ -18605,9 +18623,9 @@
+                     for (int i = 0; i < en.n; ++i) {
+                         const auto& tp = pe[a + (size_t) i];
+                         en.tok[i] = tp.first;
+-                        const int dst = gg::deterministic::enabled() ? tp.first * kPicks + tp.second : tp.first;
++                        const int dst = gg::deterministic::ordered_merge() ? tp.first * kPicks + tp.second : tp.first;
+                         cpu_rows.push_back({dst, h_w[tp.first * kPicks + tp.second]});
+-                        if (!gg::deterministic::enabled()) cm.cpu[en.tok[i]] = 1;
++                        if (!gg::deterministic::ordered_merge()) cm.cpu[en.tok[i]] = 1;
+                     }
+                     nslots += en.n;
+                     ents.push_back(en);
+@@ -18657,7 +18675,7 @@
+             }
+         }
+         if (gg::deterministic::enabled() && nrows == 0) prof_mark(d, 7);
+-        if (gg::deterministic::enabled() && nrows > 0) scatter_rows(d.ed, ordered, nrows, D, d.det_out, s);
++        if (gg::deterministic::ordered_merge() && nrows > 0) scatter_rows(d.ed, ordered, nrows, D, d.det_out, s);
+         if (gg::deterministic::enabled()) prof_mark(d, 8);
+         if (!ents.empty()) {
+             const double tc = now_ms();
+@@ -18667,7 +18685,7 @@
+                     trace_expert_io(l.il, en.tok[i], en.e, 0, c_xhd.data() + (size_t) (en.slot0 + i) * g.ff, g.ff);
+                     trace_expert_io(l.il, en.tok[i], en.e, 1, c_yd.data() + (size_t) (en.slot0 + i) * D, D);
+                 }
+-            if (gg::deterministic::enabled()) {
++            if (gg::deterministic::ordered_merge()) {
+                 for (int sl = 0; sl < nslots; ++sl)
+                     CK(cudaMemcpyAsync(d.det_out + (size_t) cpu_rows[(size_t) sl].first * D,
+                                        c_yd.data() + (size_t) sl * D, (size_t) D * sizeof(float),
+@@ -18685,7 +18703,7 @@
+             st.cpu_ms += now_ms() - tc;
+         }
+         if (gg::deterministic::enabled()) prof_mark(d, 9);
+-        if (gg::deterministic::enabled()) {
++        if (gg::deterministic::ordered_merge()) {
+             Combine ordered_cm = {};
+             for (int t = 0; t < T; ++t) {
+                 ordered_cm.n[t] = l.k_exp;
+diff -ruN base/tests/ds4_native_ordered_test.cpp work/tests/ds4_native_ordered_test.cpp
+--- base/tests/ds4_native_ordered_test.cpp	1970-01-01 08:00:00.000000000 +0800
++++ work/tests/ds4_native_ordered_test.cpp	2026-11-04 01:31:34.395276600 +0800
+@@ -0,0 +1,27 @@
++#include "../src/ds4/ds4_deterministic_math.hpp"
++
++#include <cstdio>
++
++namespace gg = strata::ds4::gguf;
++#define CHECK(expr) do { if (!(expr)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #expr); return 1; } } while (0)
++
++int main() {
++    CHECK(gg::native_ordered::parse(nullptr) == 0);
++    CHECK(gg::native_ordered::parse("0") == 0);
++    CHECK(gg::native_ordered::parse("1") == 1);
++
++    const char* invalid[] = {"", "2", "-1", "01", "true", " 1", "1 ", "0x1"};
++    for (const char* value : invalid) CHECK(gg::native_ordered::parse(value) == -1);
++
++    const char* modes[] = {nullptr, "0", "1"};
++    for (int det = 0; det <= 1; ++det)
++        for (const char* ordered : modes)
++            for (const char* canonical : modes) {
++                const bool expect_ordered = det != 0 || gg::native_ordered::parse(ordered) == 1;
++                const bool expect_canonical = det != 0 || gg::native_canonical::parse(canonical) == 1;
++                CHECK(gg::deterministic::ordered_merge(det != 0, ordered) == expect_ordered);
++                CHECK(gg::deterministic::canonical_math(det != 0, canonical) == expect_canonical);
++            }
++
++    std::puts("DS4_NATIVE_ORDERED_COMBINE: default off, strict values and independent dispatch passed");
++}

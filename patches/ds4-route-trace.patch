@@ -1,0 +1,21 @@
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -18145,6 +18145,18 @@
+         const double tw = now_ms();
+         CK(cudaEventSynchronize(d.ev));
+         st.gpu_wait_ms += now_ms() - tw;
++        static const bool trace_routes = std::getenv("DS4_TRACE_ROUTES") != nullptr;
++        static const int trace_layer = std::getenv("DS4_TRACE_LAYER") ? std::atoi(std::getenv("DS4_TRACE_LAYER")) : -1;
++        if (trace_routes && (trace_layer < 0 || trace_layer == l.il)) {
++            for (int t = 0; t < T; ++t)
++                for (int i = 0; i < l.k_exp; ++i) {
++                    const int e = h_idx[t * kPicks + i];
++                    std::fprintf(stderr, "DS4_ROUTE layer %d token %d pick %d expert %d slot %d types %d,%d,%d weight %.9g\n",
++                                 l.il, t, i, e, e >= 0 && e < l.n_exp ? l.slot[(size_t) e] : -2,
++                                 gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 1), gg::expert_type(l.lay, 2),
++                                 h_w[t * kPicks + i]);
++                }
++        }
+         if (ep4()) return ep_moe(l, d, T, hs, fuse, err);
+         // the picks by expert: the VRAM ones' rows (gathered inputs, one GEMV per matrix for all their tokens), the
+         // CPU lane's entries

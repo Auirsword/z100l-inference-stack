@@ -1,0 +1,61 @@
+{
+  "_comment": "DS4 (Maya-S IQ2_XXS) \u751f\u4ea7\u914d\u7f6e",
+  "exe": "/work/maya-ds4-z100l/build-906/maya-ds4",
+  "cwd": "/work/maya-ds4-z100l",
+  "backend": "hip",
+  "model_name": "LLM-server-flash",
+  "tokenizer": "/models/deepseek-v41-flash-1017/patched/Maya-S/maya-ds4/tokenizer",
+  "host": "0.0.0.0",
+  "port": 18100,
+  "sampling": {
+    "temperature": 0.0,
+    "top_p": 1.0
+  },
+  "reasoning_effort": "high",
+  "gpu": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "log": "/work/serve/ds4-1m-ve-ve16.log",
+  "args": [
+    "--pack",
+    "/models/deepseek-v41-flash-1017/patched/Maya-S/maya-ds4",
+    "--gpus",
+    "0,1,2,3",
+    "--tp",
+    "4",
+    "--max-context",
+    "1048576",
+    "--prefill-chunk",
+    "16384",
+    "--reserve-mib",
+    "3072",
+    "--dspark",
+    "on",
+    "--suffix-draft",
+    "0",
+    "--vision",
+    "off",
+    "--mmap-experts",
+    "auto",
+    "--parallel",
+    "1",
+    "--vram-experts",
+    "1.6"
+  ],
+  "env": {
+    "DS4_DSPARK_MAX": "8",
+    "DS4_SYNC": "1",
+    "STRATA_DS4_SLOT_DIR": "/data/kv/ds4",
+    "STRATA_DS4_SLOT_RAM_GB": "8",
+    "STRATA_DS4_SLOT_GB": "16",
+    "STRATA_DS4_SLOT_CAP": "4",
+    "STRATA_DS4_SLOT_KEEP": "1",
+    "DS4_TP_GGUF_UNEVEN": "1",
+    "DS4_AR_ZC": "2",
+    "DS4_W16_MB": "2048"
+  },
+  "api_key": "sk-ds4-REPLACE_ME"
+}
